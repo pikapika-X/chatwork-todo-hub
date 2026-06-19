@@ -200,16 +200,16 @@
     .card.dragging{opacity:.4}
 
     /* assignee board (compact) */
-    .board{display:flex;gap:10px;overflow-x:auto;padding-bottom:10px}
-    .col{flex:0 0 188px;display:flex;flex-direction:column;gap:7px}
+    .board{display:flex;gap:10px;overflow-x:auto;padding-bottom:10px;align-items:flex-start}
+    .col{flex:0 0 188px;width:188px;min-width:0;max-width:188px;display:flex;flex-direction:column;gap:7px}
     .col-h{position:sticky;top:0;background:var(--paper);padding:3px 2px;border-bottom:2px solid var(--green);
       font-weight:800;font-size:12px;display:flex;justify-content:space-between;align-items:center}
     .col-h .cnt{color:var(--sub);font-size:11px;font-weight:700}
     .col-h{cursor:grab}
     .col-h:active{cursor:grabbing}
     .board .colph{flex:0 0 4px;align-self:stretch;background:var(--green);border-radius:2px;min-height:60px}
-    .board .card{padding:7px 8px;cursor:default}
-    .board .body{-webkit-line-clamp:2;font-size:12px}
+    .board .card{padding:7px 8px;cursor:default;min-width:0;max-width:100%}
+    .board .body{-webkit-line-clamp:2;font-size:12px;overflow-wrap:anywhere}
 
     .empty{border:1px dashed var(--line2);border-radius:8px;padding:30px;text-align:center;color:var(--sub)}
     .loading{padding:40px;text-align:center;color:var(--sub)}
