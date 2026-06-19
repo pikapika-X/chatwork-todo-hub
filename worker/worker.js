@@ -67,6 +67,22 @@ async function cwGet(token, path) {
   return fetch(CW_BASE + path, { headers: cwHeaders(token) });
 }
 
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+/**
+ * タスク取得を 429/5xx のとき少し待ってリトライする。
+ * subrequest 上限(50)に収めるため maxAttempts は小さく保つ（1バッチ15室×3回=45）。
+ */
+async function cwGetTasksRetry(token, roomId, maxAttempts) {
+  let res;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    res = await cwGet(token, '/rooms/' + roomId + '/tasks?status=open');
+    if (res.status !== 429 && res.status < 500) return res; // 成功 or 恒久エラーは即返す
+    if (attempt < maxAttempts) await sleep(res.status === 429 ? 1400 : 700 * attempt);
+  }
+  return res; // リトライ尽きてもまだ 429/5xx の可能性あり（呼び出し側でスキップ）
+}
+
 async function getMe(token) {
   if (!token) throw new Error('APIトークンがありません');
   const res = await cwGet(token, '/me');
@@ -167,7 +183,7 @@ async function apiRoomTasksBatch(token, rooms, force, ctx) {
   const tasks = [];
   const stats = { rooms: (rooms || []).length, cacheHit: 0, c200: 0, c204: 0, c403: 0, c404: 0, c429: 0, c5xx: 0, other: 0 };
 
-  await mapLimit(rooms || [], 6, async (room) => {
+  await mapLimit(rooms || [], 4, async (room) => {
     const lut = room.last_update_time || 0;
     // last_update_time をキーに含める → 部屋が更新されるとキーが変わり自動で取り直しになる
     const cacheKey = new Request('https://cw-cache.local/rt/' + dg + '/' + room.room_id + '/' + lut);
@@ -182,7 +198,7 @@ async function apiRoomTasksBatch(token, rooms, force, ctx) {
       }
     }
 
-    const res = await cwGet(token, '/rooms/' + room.room_id + '/tasks?status=open');
+    const res = await cwGetTasksRetry(token, room.room_id, 3); // 429/5xx は最大2回リトライ
     const code = res.status;
     if (code === 200) stats.c200++; else if (code === 204) stats.c204++; else if (code === 403) stats.c403++;
     else if (code === 404) stats.c404++; else if (code === 429) stats.c429++; else if (code >= 500) stats.c5xx++; else stats.other++;

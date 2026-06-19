@@ -16,7 +16,8 @@
      既存 UI のコードは google.script.run.withSuccessHandler(...).apiXxx(...) のまま動く。 */
   (function () {
     var WORKER_URL = 'https://chatwork-todo-hub.usdm-information.workers.dev';
-    var ROOM_BATCH = 40; // Cloudflare無料枠の subrequest 上限(50)を超えないよう、ルームを分割して取得
+    var ROOM_BATCH = 15;       // 1バッチ=最大15室。Worker側で429リトライしても subrequest上限(50)に収まる(15×3=45)
+    var BATCH_CONCURRENCY = 2; // バッチ(Worker呼び出し)を同時に投げる数。多すぎるとChatworkが429を返し取りこぼす
     function makeRunner() {
       var onOk = function () {}, onFail = function () {};
       function callRaw(action, payload) {
@@ -30,17 +31,26 @@
       function call(action, payload) {
         callRaw(action, payload).then(function (d) { onOk(d); }).catch(function (e) { onFail(e); });
       }
-      // 全ルームのタスクを取得: roomList（軽量）→ 40室ずつ roomTasksBatch を並列 → 結合
+      // 全ルームのタスクを取得: roomList（軽量）→ 15室ずつ roomTasksBatch を同時数を絞って実行 → 結合
       function roomTasks(token, force) {
         callRaw('roomList', { token: token }).then(function (list) {
           if (!list || !list.ok) { onOk(list || { ok: false, message: 'ルーム一覧の取得に失敗しました' }); return; }
           var rooms = list.rooms || [];
           var batches = [];
           for (var i = 0; i < rooms.length; i += ROOM_BATCH) batches.push(rooms.slice(i, i + ROOM_BATCH));
-          Promise.all(batches.map(function (b) {
-            return callRaw('roomTasksBatch', { token: token, rooms: b, force: !!force })
-              .catch(function () { return { ok: false, tasks: [] }; }); // 一部失敗は握りつぶして部分結果を返す
-          })).then(function (results) {
+          var results = new Array(batches.length);
+          var next = 0;
+          // バッチを BATCH_CONCURRENCY 個ずつ順に処理（Chatworkへの同時アクセスを抑え429を回避）
+          function runOne() {
+            if (next >= batches.length) return Promise.resolve();
+            var idx = next++;
+            return callRaw('roomTasksBatch', { token: token, rooms: batches[idx], force: !!force })
+              .catch(function () { return { ok: false, tasks: [] }; }) // 一部失敗は握りつぶして部分結果を返す
+              .then(function (r) { results[idx] = r; return runOne(); });
+          }
+          var workers = [];
+          for (var w = 0; w < Math.min(BATCH_CONCURRENCY, batches.length); w++) workers.push(runOne());
+          Promise.all(workers).then(function () {
             var tasks = [];
             results.forEach(function (r) { if (r && r.ok && r.tasks) tasks = tasks.concat(r.tasks); });
             var roomsBrief = rooms.map(function (r) { return { name: r.name, lastUpdate: r.last_update_time || 0 }; });
