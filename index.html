@@ -437,13 +437,16 @@
     function silentRefresh() {
       if (document.hidden || !token) return;
       if (!document.getElementById('remModal').classList.contains('hidden')) return; // ダイアログ中は触らない
-      google.script.run.withSuccessHandler(function (r) {
-        if (!r.ok) return;
-        cache.room = r.tasks;
-        if (r.me) myId = r.me.accountId;
-        if (r.rooms) roomsBrief = r.rooms;
-        buildRoomFilter(); render();
-      }).withFailureHandler(function () {}).apiRoomTasks(token, false); // 自動更新は軽量（変化のあった部屋だけ）
+      if (pushTimer) flushPush();        // 自分の未送信の変更を先に保存
+      pullSettings(function () {          // 別端末の設定変更を取り込んでから…
+        google.script.run.withSuccessHandler(function (r) {
+          if (!r.ok) return;
+          cache.room = r.tasks;
+          if (r.me) myId = r.me.accountId;
+          if (r.rooms) roomsBrief = r.rooms;
+          buildRoomFilter(); buildAssigneeFilter(); render();
+        }).withFailureHandler(function () {}).apiRoomTasks(token, false); // タスクは軽量（変化のあった部屋だけ）
+      });
     }
 
     function readJson(k, def) { try { return JSON.parse(localStorage.getItem(k)) || def; } catch (e) { return def; } }
