@@ -39,9 +39,10 @@ export default {
     const action = body && body.action;
     try {
       switch (action) {
-        case 'init':         return jsonResponse(await apiInit(body.token));
-        case 'roomTasks':    return jsonResponse(await apiRoomTasks(body.token, !!body.force, ctx));
-        case 'completeTask': return jsonResponse(await apiCompleteTask(body.token, body.roomId, body.taskId));
+        case 'init':           return jsonResponse(await apiInit(body.token));
+        case 'roomList':       return jsonResponse(await apiRoomList(body.token));
+        case 'roomTasksBatch': return jsonResponse(await apiRoomTasksBatch(body.token, body.rooms, !!body.force, ctx));
+        case 'completeTask':   return jsonResponse(await apiCompleteTask(body.token, body.roomId, body.taskId));
         case 'loadSettings': return jsonResponse(await apiLoadSettings(env, body.token));
         case 'saveSettings': return jsonResponse(await apiSaveSettings(env, body.token, body.payload, body.clientUpdatedAt));
         default:             return jsonResponse({ ok: false, message: 'unknown action' }, 400);
@@ -140,14 +141,31 @@ async function apiInit(token) {
   return { ok: true, me: publicMe(me) };
 }
 
-async function apiRoomTasks(token, force, ctx) {
+/**
+ * 部屋一覧（+本人情報）。subrequest は2回だけ。
+ * クライアントはこの rooms を ~40室ずつに分けて roomTasksBatch を複数回呼ぶ
+ * （Cloudflare 無料プランの「1呼び出しあたり subrequest 50回」制限を回避するため）。
+ */
+async function apiRoomList(token) {
+  const me = await getMe(token);          // 1 subrequest
+  const rooms = await getRooms(token);    // 1 subrequest（last_update_time を含む）
+  const slim = rooms.map(r => ({
+    room_id: r.room_id,
+    name: r.name,
+    icon_path: r.icon_path || '',
+    last_update_time: r.last_update_time || 0
+  }));
+  return { ok: true, me: publicMe(me), rooms: slim };
+}
+
+/** 渡された部屋（最大40室程度）の未完了タスクをまとめて取得。部屋単位でキャッシュ。 */
+async function apiRoomTasksBatch(token, rooms, force, ctx) {
+  if (!token) throw new Error('APIトークンがありません');
   const dg = await tokenDigest(token);
-  const me = await getMe(token);          // 1 リクエスト
-  const rooms = await getRooms(token);    // 1 リクエスト（last_update_time を含む）
   const cache = caches.default;
   const tasks = [];
 
-  await mapLimit(rooms, 8, async (room) => {
+  await mapLimit(rooms || [], 6, async (room) => {
     const lut = room.last_update_time || 0;
     // last_update_time をキーに含める → 部屋が更新されるとキーが変わり自動で取り直しになる
     const cacheKey = new Request('https://cw-cache.local/rt/' + dg + '/' + room.room_id + '/' + lut);
@@ -190,7 +208,7 @@ async function apiRoomTasks(token, force, ctx) {
     ctx.waitUntil(cache.put(cacheKey, resp)); // 6時間保持
   });
 
-  return { ok: true, me: publicMe(me), tasks: tasks, rooms: roomsBrief(rooms), cached: false };
+  return { ok: true, tasks: tasks };
 }
 
 async function apiCompleteTask(token, roomId, taskId) {

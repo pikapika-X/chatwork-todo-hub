@@ -16,24 +16,43 @@
      既存 UI のコードは google.script.run.withSuccessHandler(...).apiXxx(...) のまま動く。 */
   (function () {
     var WORKER_URL = 'https://chatwork-todo-hub.usdm-information.workers.dev';
+    var ROOM_BATCH = 40; // Cloudflare無料枠の subrequest 上限(50)を超えないよう、ルームを分割して取得
     function makeRunner() {
       var onOk = function () {}, onFail = function () {};
-      function call(action, payload) {
+      function callRaw(action, payload) {
         var data = Object.assign({ action: action }, payload);
-        fetch(WORKER_URL, {
+        return fetch(WORKER_URL, {
           method: 'POST',
           headers: { 'Content-Type': 'text/plain;charset=UTF-8' }, // 単純リクエスト化（CORSプリフライト回避）
           body: JSON.stringify(data)
-        })
-          .then(function (r) { return r.json(); })
-          .then(function (d) { onOk(d); })
-          .catch(function (e) { onFail(e); });
+        }).then(function (r) { return r.json(); });
+      }
+      function call(action, payload) {
+        callRaw(action, payload).then(function (d) { onOk(d); }).catch(function (e) { onFail(e); });
+      }
+      // 全ルームのタスクを取得: roomList（軽量）→ 40室ずつ roomTasksBatch を並列 → 結合
+      function roomTasks(token, force) {
+        callRaw('roomList', { token: token }).then(function (list) {
+          if (!list || !list.ok) { onOk(list || { ok: false, message: 'ルーム一覧の取得に失敗しました' }); return; }
+          var rooms = list.rooms || [];
+          var batches = [];
+          for (var i = 0; i < rooms.length; i += ROOM_BATCH) batches.push(rooms.slice(i, i + ROOM_BATCH));
+          Promise.all(batches.map(function (b) {
+            return callRaw('roomTasksBatch', { token: token, rooms: b, force: !!force })
+              .catch(function () { return { ok: false, tasks: [] }; }); // 一部失敗は握りつぶして部分結果を返す
+          })).then(function (results) {
+            var tasks = [];
+            results.forEach(function (r) { if (r && r.ok && r.tasks) tasks = tasks.concat(r.tasks); });
+            var roomsBrief = rooms.map(function (r) { return { name: r.name, lastUpdate: r.last_update_time || 0 }; });
+            onOk({ ok: true, me: list.me, tasks: tasks, rooms: roomsBrief, cached: false });
+          }).catch(function (e) { onFail(e); });
+        }).catch(function (e) { onFail(e); });
       }
       var api = {
         withSuccessHandler: function (fn) { if (fn) onOk = fn; return api; },
         withFailureHandler: function (fn) { if (fn) onFail = fn; return api; },
         apiInit: function (token) { call('init', { token: token }); },
-        apiRoomTasks: function (token, force) { call('roomTasks', { token: token, force: !!force }); },
+        apiRoomTasks: function (token, force) { roomTasks(token, force); },
         apiCompleteTask: function (token, roomId, taskId) { call('completeTask', { token: token, roomId: roomId, taskId: taskId }); },
         apiLoadSettings: function (token) { call('loadSettings', { token: token }); },
         apiSaveSettings: function (token, payload, clientUpdatedAt) { call('saveSettings', { token: token, payload: payload, clientUpdatedAt: clientUpdatedAt }); }
