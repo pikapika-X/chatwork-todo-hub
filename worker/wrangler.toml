@@ -1,0 +1,8 @@
+name = "chatwork-todo-hub"
+main = "worker.js"
+compatibility_date = "2024-11-01"
+
+# 設定同期用の KV。実際の id は `wrangler kv namespace create SETTINGS` 実行後に書き換える。
+[[kv_namespaces]]
+binding = "SETTINGS"
+id = "212d57d010124e6394d664d6b585a5c0"
