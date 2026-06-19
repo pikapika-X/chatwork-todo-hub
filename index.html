@@ -304,6 +304,7 @@
           <div id="roomList" class="roomlist"></div>
         </div>
       </div>
+      <label class="newonly" title="編集した過去タスクも表示"><input type="checkbox" id="showAll" onchange="render()"> 全部表示</label>
       <button id="addColBtn" class="ghost hidden" onclick="addColumn()" title="タスクをドラッグして仕分けできます">＋ インデックス</button>
     </div>
 
@@ -331,6 +332,7 @@
 
   <script>
     var TOKEN_KEY = 'cwTodoToken';
+    var BASE_KEY = 'cwTodoBaseline2';
     var myId = null;
     var COL_KEY = 'cwTodoColumns';   // 旧（タスク用へ移行）
     var ASSIGN_KEY = 'cwTodoAssign'; // 旧
@@ -439,12 +441,16 @@
     function saveCols() { var s = activeScope(); localStorage.setItem(COL_KEYS[s], JSON.stringify(COLS[s])); }
     function saveAssign() { var s = activeScope(); localStorage.setItem(ASG_KEYS[s], JSON.stringify(ASG[s])); }
     function saveOrder() { var s = activeScope(); localStorage.setItem(ORD_KEYS[s], JSON.stringify(ORD[s])); }
+    function getBaseline() { var v = localStorage.getItem(BASE_KEY); return v ? Number(v) : null; }
+    function setBaseline(v) { localStorage.setItem(BASE_KEY, String(v)); }
 
     function saveToken() {
       var t = document.getElementById('tokenInput').value.trim();
       if (!t) { setTokenMsg('トークンを入力してください。'); return; }
       token = t;
       if (document.getElementById('remember').checked) localStorage.setItem(TOKEN_KEY, t);
+      // トークンを入れ直したら起点を取り直す（次の load で「今」の最大IDが起点になる）
+      localStorage.removeItem(BASE_KEY);
       connect();
     }
 
@@ -496,6 +502,11 @@
         cache.room = r.tasks;
         if (r.me) myId = r.me.accountId;
         if (r.rooms) roomsBrief = r.rooms;
+        if (getBaseline() === null) { // 初回接続＝起点
+          var maxId = 0;
+          r.tasks.forEach(function (t) { if (Number(t.taskId) > maxId) maxId = Number(t.taskId); });
+          setBaseline(maxId);
+        }
         afterData();
       }).withFailureHandler(failLoad).apiRoomTasks(token, !!force);
     }
@@ -618,7 +629,10 @@
       var tasks = currentTasks().slice();
       var kind = document.getElementById('kind').value;
       var q = document.getElementById('search').value.trim().toLowerCase();
+      var base = getBaseline() || 0;
+      var showAll = view === 'bookmark' || document.getElementById('showAll').checked;
       return tasks.filter(function (t) {
+        if (!showAll && Number(t.taskId) <= base) return false;
         if (view !== 'bookmark') { // ブックマークはタスク/メモ問わず全部見せる
           if (kind === 'task' && t.isMemo) return false;
           if (kind === 'memo' && !t.isMemo) return false;
