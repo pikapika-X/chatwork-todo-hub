@@ -238,6 +238,10 @@
     .remitem{border:1px solid var(--line);border-radius:7px;padding:8px;margin-bottom:7px;font-size:12px}
     .remitem .t{font-weight:700;color:var(--green)}
     .remitem button{min-height:24px;padding:0 8px;font-size:11px;background:var(--surface);border:1px solid var(--line);color:#b42318;margin-top:5px}
+    .notifyBox{border:1px solid var(--line);border-radius:7px;padding:9px;margin-bottom:9px;background:var(--surface)}
+    .notifyBox label{display:flex;align-items:center;gap:7px;cursor:pointer;font-weight:700;font-size:13px}
+    .notifyBox input{width:16px;height:16px}
+    .notifyNote{color:var(--sub);font-size:11px;margin-top:5px;line-height:1.45}
     #imgPop{position:fixed;z-index:50;pointer-events:none;display:none;border:1px solid var(--line);
       border-radius:8px;background:#fff;box-shadow:var(--shadow);padding:4px}
     #imgPop img{max-width:320px;max-height:320px;display:block;border-radius:5px}
@@ -388,6 +392,9 @@
     var draggingColId = null;    // インデックス列の並べ替え中の列ID
     var REM_KEY = 'cwTodoReminders';
     var reminders = [];
+    var NOTIFY_KEY = 'cwTodoNotify'; // 本体通知のオンオフ（端末ごと・同期しない）
+    var notifyOn = false;
+    var swReg = null;                // 通知用サービスワーカーの登録
     var BM_KEY = 'cwTodoBookmarks';
     var bookmarks = [];
     var draggingTask = null;
@@ -422,6 +429,7 @@
       var note = document.getElementById('note');
       if (note) note.addEventListener('input', function () { lsSet(NOTE_KEY, note.value); });
       initRemZone();
+      registerSW();
       setInterval(checkReminders, 30000);
       checkReminders();
       setInterval(silentRefresh, 300000); // 5分ごとに自動更新
@@ -587,6 +595,7 @@
       ORD.memo = readJson(ORD_KEYS.memo, {});
       ORD.bm = readJson(ORD_KEYS.bm, {});
       reminders = readJson(REM_KEY, []);
+      notifyOn = (localStorage.getItem(NOTIFY_KEY) === '1'); // 端末ごとの通知設定
       bookmarks = readJson(BM_KEY, []);
       selectedRooms = readJson(ROOMS_KEY, 'all');
       selectedAssignees = readJson(ASSIGNEES_KEY, 'all');
@@ -1289,6 +1298,54 @@
       closeRemDialog(); updateRemCount();
     }
     function requestNotify() { try { if ('Notification' in window && Notification.permission === 'default') Notification.requestPermission(); } catch (_) {} }
+    // 通知用サービスワーカーを登録（fetch を持たないのでアプリ本体はキャッシュしない）
+    function registerSW() {
+      if (!('serviceWorker' in navigator)) return;
+      try {
+        navigator.serviceWorker.register('sw.js').catch(function (_) {});
+        navigator.serviceWorker.ready.then(function (reg) { swReg = reg; }).catch(function (_) {});
+      } catch (_) {}
+    }
+    // 通知許可をユーザー操作の中から要求（コールバック/Promise 両対応・二重呼び防止）
+    function requestNotifyPerm(cb) {
+      var done = false; function fin(g) { if (done) return; done = true; cb(g); }
+      try {
+        if (!('Notification' in window)) { fin(false); return; }
+        if (Notification.permission === 'granted') { fin(true); return; }
+        if (Notification.permission === 'denied') { fin(false); return; }
+        var p = Notification.requestPermission(function (res) { fin(res === 'granted'); });
+        if (p && p.then) p.then(function (res) { fin(res === 'granted'); });
+      } catch (_) { fin(false); }
+    }
+    function toggleNotify(on) {
+      if (on) {
+        requestNotifyPerm(function (granted) {
+          notifyOn = granted;
+          if (granted) { localStorage.setItem(NOTIFY_KEY, '1'); } else { localStorage.removeItem(NOTIFY_KEY); }
+          renderRemList();
+          if (!granted) alert('通知を有効にできませんでした。ブラウザ（またはOS）の通知許可がブロックされていないかご確認ください。');
+        });
+      } else {
+        notifyOn = false; localStorage.removeItem(NOTIFY_KEY); renderRemList();
+      }
+    }
+    function notifyStatusText() {
+      if (!('Notification' in window)) return 'この端末／ブラウザは通知に対応していません。';
+      if (Notification.permission === 'denied') return '⚠ ブラウザで通知がブロックされています。サイトの設定から許可してください。';
+      if (notifyOn && Notification.permission === 'granted') return 'アプリを開いている間、時刻になるとPC/スマホ本体に通知します。';
+      return 'オンにすると、時刻になったとき本体に通知します（この端末のみ）。';
+    }
+    function buildNotifyToggle() {
+      var box = document.createElement('div'); box.className = 'notifyBox';
+      var lab = document.createElement('label');
+      var cb = document.createElement('input'); cb.type = 'checkbox'; cb.checked = notifyOn;
+      cb.onchange = function () { toggleNotify(cb.checked); };
+      var sp = document.createElement('span'); sp.textContent = '🔔 本体に通知（この端末）';
+      lab.appendChild(cb); lab.appendChild(sp);
+      var note = document.createElement('div'); note.className = 'notifyNote'; note.textContent = notifyStatusText();
+      box.appendChild(lab); box.appendChild(note);
+      return box;
+    }
     function checkReminders() {
       var now = Date.now(), changed = false;
       reminders.forEach(function (r) { if (!r.fired && r.time <= now) { fireReminder(r); r.fired = true; changed = true; } });
@@ -1296,8 +1353,15 @@
     }
     function fireReminder(r) {
       var title = '⏰ リマインド' + (r.room ? '：' + r.room : '');
+      if (!notifyOn) { try { document.title = '⏰ リマインド！'; } catch (_) {} return; } // 通知オフ時は本体に出さない
+      var opts = { body: r.body, icon: 'icon-192.png?v=2', badge: 'icon-192.png?v=2', tag: 'rem-' + r.id, renotify: true };
       var shown = false;
-      try { if ('Notification' in window && Notification.permission === 'granted') { new Notification(title, { body: r.body }); shown = true; } } catch (_) {}
+      try {
+        if ('Notification' in window && Notification.permission === 'granted') {
+          if (swReg && swReg.showNotification) { swReg.showNotification(title, opts); shown = true; } // スマホ対応はこちら
+          else if (typeof Notification === 'function') { try { new Notification(title, opts); shown = true; } catch (_) {} }
+        }
+      } catch (_) {}
       if (!shown) { try { document.title = '⏰ リマインド！'; } catch (_) {} alert(title + '\n' + r.body); }
     }
     function updateRemCount() { var el = document.getElementById('remCount'); if (el) el.textContent = reminders.filter(function (r) { return !r.fired; }).length; }
@@ -1308,8 +1372,12 @@
     }
     function renderRemList() {
       var el = document.getElementById('remList'); el.innerHTML = '';
+      el.appendChild(buildNotifyToggle());
       var pend = reminders.filter(function (r) { return !r.fired; }).sort(function (a, b) { return a.time - b.time; });
-      if (!pend.length) { el.innerHTML = '<div style="color:var(--sub);font-size:12px">予定中のリマインドはありません。</div>'; return; }
+      if (!pend.length) {
+        var none = document.createElement('div'); none.style.cssText = 'color:var(--sub);font-size:12px';
+        none.textContent = '予定中のリマインドはありません。'; el.appendChild(none); return;
+      }
       pend.forEach(function (r) {
         var d = new Date(r.time);
         var item = document.createElement('div'); item.className = 'remitem';
