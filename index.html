@@ -237,7 +237,14 @@
       background:#fff;border:1px solid var(--line);border-radius:10px;box-shadow:var(--shadow);padding:10px}
     .remitem{border:1px solid var(--line);border-radius:7px;padding:8px;margin-bottom:7px;font-size:12px}
     .remitem .t{font-weight:700;color:var(--green)}
-    .remitem button{min-height:24px;padding:0 8px;font-size:11px;background:var(--surface);border:1px solid var(--line);color:#b42318;margin-top:5px}
+    .remitem .remacts{display:flex;gap:6px;margin-top:6px}
+    .remitem .remacts button{min-height:24px;padding:0 10px;font-size:11px;background:var(--surface);border:1px solid var(--line);color:#b42318}
+    .remitem .remacts .edit{color:var(--ink)}
+    .remrep{display:flex;align-items:center;flex-wrap:wrap;gap:8px;margin-top:10px;font-size:13px}
+    .remrep label{display:flex;align-items:center;gap:6px;font-weight:700}
+    .remrep select{min-height:30px;padding:2px 6px;border:1px solid var(--line);border-radius:6px;background:var(--surface);color:var(--ink)}
+    .remrep #remRepNWrap{display:flex;align-items:center;gap:5px;color:var(--sub)}
+    .remrep #remRepN{width:60px;min-height:30px;padding:2px 6px;border:1px solid var(--line);border-radius:6px;background:var(--surface);color:var(--ink)}
     .notifyBox{border:1px solid var(--line);border-radius:7px;padding:9px;margin-bottom:9px;background:var(--surface)}
     .notifyBox label{display:flex;align-items:center;gap:7px;cursor:pointer;font-weight:700;font-size:13px}
     .notifyBox input{width:16px;height:16px}
@@ -349,9 +356,21 @@
   <div id="remList" class="remlist hidden"></div>
   <div id="remModal" class="modal hidden">
     <div class="dialog">
-      <h2>リマインド設定</h2>
+      <h2 id="remDlgTitle">リマインド設定</h2>
       <div id="remTaskLabel" class="lbl"></div>
       <input id="remWhen" type="datetime-local">
+      <div class="remrep">
+        <label>🔁 繰り返し
+          <select id="remRepeat" onchange="onRepeatChange()">
+            <option value="none">なし</option>
+            <option value="hour">○時間ごと</option>
+            <option value="day">○日ごと（毎日）</option>
+            <option value="week">毎週（同じ曜日）</option>
+            <option value="month">毎月（同じ日）</option>
+          </select>
+        </label>
+        <span id="remRepNWrap" class="hidden"><input id="remRepN" type="number" min="1" value="1"><span id="remRepNUnit">時間</span>ごと</span>
+      </div>
       <div class="acts">
         <button class="ghost" onclick="closeRemDialog()">キャンセル</button>
         <button onclick="saveReminder()">設定する</button>
@@ -399,6 +418,7 @@
     var bookmarks = [];
     var draggingTask = null;
     var pendingRemTask = null;
+    var editingRemId = null; // リマインド編集中のID（新規時はnull）
 
     function applyTheme(t) {
       var dark = (t === 'dark');
@@ -1276,26 +1296,61 @@
     }
     function pad2(n) { return ('0' + n).slice(-2); }
     function toLocalInput(d) { return d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate()) + 'T' + pad2(d.getHours()) + ':' + pad2(d.getMinutes()); }
+    function setRepeatUI(rep, n) {
+      document.getElementById('remRepeat').value = rep || 'none';
+      document.getElementById('remRepN').value = n || 1;
+      onRepeatChange();
+    }
+    function onRepeatChange() {
+      var rep = document.getElementById('remRepeat').value;
+      var wrap = document.getElementById('remRepNWrap');
+      if (rep === 'hour' || rep === 'day') {
+        document.getElementById('remRepNUnit').textContent = (rep === 'hour' ? '時間' : '日');
+        wrap.classList.remove('hidden');
+      } else { wrap.classList.add('hidden'); }
+    }
     function openRemDialog(t) {
-      pendingRemTask = t;
+      editingRemId = null; pendingRemTask = t;
+      document.getElementById('remDlgTitle').textContent = 'リマインド設定';
       document.getElementById('remTaskLabel').textContent = (cleanBody(t.body) || '(本文なし)').slice(0, 120);
       document.getElementById('remWhen').value = toLocalInput(new Date(Date.now() + 3600000));
+      setRepeatUI('none', 1);
       document.getElementById('remModal').classList.remove('hidden');
       requestNotify();
     }
-    function closeRemDialog() { document.getElementById('remModal').classList.add('hidden'); pendingRemTask = null; }
+    function editReminder(id) {
+      var r = reminders.filter(function (x) { return x.id === id; })[0];
+      if (!r) return;
+      editingRemId = id; pendingRemTask = null;
+      document.getElementById('remDlgTitle').textContent = 'リマインド編集';
+      document.getElementById('remTaskLabel').textContent = (r.room ? '[' + r.room + '] ' : '') + (r.body || '');
+      document.getElementById('remWhen').value = toLocalInput(new Date(r.time));
+      setRepeatUI(r.rep || 'none', r.repN || 1);
+      document.getElementById('remModal').classList.remove('hidden');
+      requestNotify();
+    }
+    function closeRemDialog() { document.getElementById('remModal').classList.add('hidden'); pendingRemTask = null; editingRemId = null; }
     function saveReminder() {
       var v = document.getElementById('remWhen').value;
       if (!v) { alert('日時を選んでください'); return; }
       var when = new Date(v).getTime();
       if (isNaN(when)) { alert('日時が正しくありません'); return; }
-      reminders.push({
-        id: 'r' + Date.now(), taskId: pendingRemTask.taskId, roomId: pendingRemTask.roomId,
-        room: pendingRemTask.roomName || '', body: (cleanBody(pendingRemTask.body) || '').slice(0, 120),
-        time: when, fired: false
-      });
+      var rep = document.getElementById('remRepeat').value;
+      var repN = Math.max(1, parseInt(document.getElementById('remRepN').value, 10) || 1);
+      if (editingRemId) {
+        var r = reminders.filter(function (x) { return x.id === editingRemId; })[0];
+        if (r) { r.time = when; r.rep = rep; r.repN = repN; r.fired = false; } // 日時を変えたら再び鳴るようにする
+      } else {
+        reminders.push({
+          id: 'r' + Date.now(), taskId: pendingRemTask.taskId, roomId: pendingRemTask.roomId,
+          room: pendingRemTask.roomName || '', body: (cleanBody(pendingRemTask.body) || '').slice(0, 120),
+          time: when, fired: false, rep: rep, repN: repN
+        });
+      }
       lsSet(REM_KEY, JSON.stringify(reminders));
       closeRemDialog(); updateRemCount();
+      var listEl = document.getElementById('remList');
+      if (listEl && !listEl.classList.contains('hidden')) renderRemList();
     }
     function requestNotify() { try { if ('Notification' in window && Notification.permission === 'default') Notification.requestPermission(); } catch (_) {} }
     // 通知用サービスワーカーを登録（fetch を持たないのでアプリ本体はキャッシュしない）
@@ -1346,15 +1401,37 @@
       box.appendChild(lab); box.appendChild(note);
       return box;
     }
+    // 次回の発火時刻を返す（DST に強い Date 演算）
+    function nextTime(time, rep, n) {
+      var d = new Date(time); n = n || 1;
+      if (rep === 'hour') d.setHours(d.getHours() + n);
+      else if (rep === 'day') d.setDate(d.getDate() + n);
+      else if (rep === 'week') d.setDate(d.getDate() + 7);
+      else if (rep === 'month') d.setMonth(d.getMonth() + 1);
+      else return time;
+      return d.getTime();
+    }
     function checkReminders() {
       var now = Date.now(), changed = false;
-      reminders.forEach(function (r) { if (!r.fired && r.time <= now) { fireReminder(r); r.fired = true; changed = true; } });
+      reminders.forEach(function (r) {
+        if (r.fired || r.time > now) return;
+        fireReminder(r); changed = true;
+        if (r.rep && r.rep !== 'none') {
+          // 繰り返しは fired にせず、次の未来の時刻へ進める（閉じていた間の積み残しは1回だけ通知）
+          var nt = nextTime(r.time, r.rep, r.repN), guard = 0;
+          while (nt <= now && guard < 100000) { nt = nextTime(nt, r.rep, r.repN); guard++; }
+          r.time = nt;
+        } else {
+          r.fired = true;
+        }
+      });
       if (changed) { lsSet(REM_KEY, JSON.stringify(reminders)); updateRemCount(); }
     }
     function fireReminder(r) {
       var title = '⏰ リマインド' + (r.room ? '：' + r.room : '');
       if (!notifyOn) { try { document.title = '⏰ リマインド！'; } catch (_) {} return; } // 通知オフ時は本体に出さない
-      var opts = { body: r.body, icon: 'icon-192.png?v=2', badge: 'icon-192.png?v=2', tag: 'rem-' + r.id, renotify: true };
+      // requireInteraction: ユーザーが操作（OK/タップ）するまで通知を消さない
+      var opts = { body: r.body, icon: 'icon-192.png?v=2', badge: 'icon-192.png?v=2', tag: 'rem-' + r.id, renotify: true, requireInteraction: true };
       var shown = false;
       try {
         if ('Notification' in window && Notification.permission === 'granted') {
@@ -1382,16 +1459,28 @@
         var d = new Date(r.time);
         var item = document.createElement('div'); item.className = 'remitem';
         var t = document.createElement('div'); t.className = 't';
-        t.textContent = (d.getMonth() + 1) + '/' + d.getDate() + ' ' + pad2(d.getHours()) + ':' + pad2(d.getMinutes());
+        t.textContent = (d.getMonth() + 1) + '/' + d.getDate() + ' ' + pad2(d.getHours()) + ':' + pad2(d.getMinutes()) + repLabel(r);
         var b = document.createElement('div'); b.textContent = (r.room ? '[' + r.room + '] ' : '') + r.body;
+        var acts = document.createElement('div'); acts.className = 'remacts';
+        var ed = document.createElement('button'); ed.textContent = '編集'; ed.className = 'edit'; ed.onclick = function () { editReminder(r.id); };
         var x = document.createElement('button'); x.textContent = '取消'; x.onclick = function () { cancelReminder(r.id); };
-        item.appendChild(t); item.appendChild(b); item.appendChild(x); el.appendChild(item);
+        acts.appendChild(ed); acts.appendChild(x);
+        item.appendChild(t); item.appendChild(b); item.appendChild(acts); el.appendChild(item);
       });
     }
     function cancelReminder(id) {
       reminders = reminders.filter(function (r) { return r.id !== id; });
       lsSet(REM_KEY, JSON.stringify(reminders));
       updateRemCount(); renderRemList();
+    }
+    function repLabel(r) {
+      if (!r.rep || r.rep === 'none') return '';
+      var n = r.repN || 1;
+      if (r.rep === 'hour') return ' 🔁' + (n > 1 ? (n + '時間ごと') : '毎時');
+      if (r.rep === 'day') return ' 🔁' + (n > 1 ? (n + '日ごと') : '毎日');
+      if (r.rep === 'week') return ' 🔁毎週';
+      if (r.rep === 'month') return ' 🔁毎月';
+      return '';
     }
   </script>
 </body>
