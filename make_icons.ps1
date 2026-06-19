@@ -41,19 +41,54 @@ function New-Icon([int]$S, [string]$out) {
   $gb.SurroundColors = @([System.Drawing.Color]::FromArgb(0, 255, 255, 255))
   $g.FillPath($gb, $gloss)
 
-  # 虹色のリム（縁取り）— 円周に沿って色相を一周させる
-  $rx = $S * 0.030; $ry = $S * 0.030; $rw2 = $S * 0.940
-  $rimWidth = $S * 0.052
-  $segs = 240
+  # ===== 虹色のリム（上品な光り方）=====
+  $ringX = $S * 0.030; $ringY = $S * 0.030; $ringDia = $S * 0.940
+  $rimWidth = $S * 0.050
+
+  # 1) 本体とリムの境目に細い暗色のラインを入れて引き締める
+  $edge = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(150, 0, 0, 0), ($S * 0.010))
+  $g.DrawEllipse($edge, ($ringX + $rimWidth * 0.5), ($ringY + $rimWidth * 0.5), ($ringDia - $rimWidth), ($ringDia - $rimWidth))
+  $edge.Dispose()
+
+  # 2) パールトーンの虹リング（彩度を抑え＝上品。360分割でなめらか）
+  $segs = 360
   $step = 360.0 / $segs
   for ($i = 0; $i -lt $segs; $i++) {
     $hue = ($i / $segs) * 360.0
-    $col = Hsv2Rgb $hue 0.95 1.0
+    $col = Hsv2Rgb $hue 0.66 0.98
     $p = New-Object System.Drawing.Pen($col, $rimWidth)
-    # 隙間が出ないよう少し重ねて描く
-    $g.DrawArc($p, $rx, $ry, $rw2, $rw2, ($i * $step), ($step + 0.9))
+    $g.DrawArc($p, $ringX, $ringY, $ringDia, $ringDia, ($i * $step), ($step + 1.3))
     $p.Dispose()
   }
+
+  # 3) 外周に極細のハイライト線（磨かれた金属の縁の光）
+  $hi = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(120, 255, 255, 255), ($S * 0.006))
+  $g.DrawEllipse($hi, ($ringX - $rimWidth * 0.28), ($ringY - $rimWidth * 0.28), ($ringDia + $rimWidth * 0.56), ($ringDia + $rimWidth * 0.56))
+  $hi.Dispose()
+
+  # 4) リング帯にだけ柔らかいスペキュラ（左上から光を受けたような艶）
+  $ringClip = New-Object System.Drawing.Drawing2D.GraphicsPath
+  $ringClip.AddEllipse($ringX, $ringY, $ringDia, $ringDia)
+  $ringClip.AddEllipse(($ringX + $rimWidth), ($ringY + $rimWidth), ($ringDia - 2 * $rimWidth), ($ringDia - 2 * $rimWidth))
+  $g.SetClip($ringClip)
+  # 左上の主ハイライト
+  $sp1 = New-Object System.Drawing.Drawing2D.GraphicsPath
+  $sp1.AddEllipse(($S * 0.04), ($S * 0.00), ($S * 0.50), ($S * 0.34))
+  $b1 = New-Object System.Drawing.Drawing2D.PathGradientBrush($sp1)
+  $b1.CenterColor = [System.Drawing.Color]::FromArgb(165, 255, 255, 255)
+  $b1.SurroundColors = @([System.Drawing.Color]::FromArgb(0, 255, 255, 255))
+  $g.FillPath($b1, $sp1)
+  $b1.Dispose(); $sp1.Dispose()
+  # 右下の控えめなハイライト
+  $sp2 = New-Object System.Drawing.Drawing2D.GraphicsPath
+  $sp2.AddEllipse(($S * 0.52), ($S * 0.66), ($S * 0.40), ($S * 0.30))
+  $b2 = New-Object System.Drawing.Drawing2D.PathGradientBrush($sp2)
+  $b2.CenterColor = [System.Drawing.Color]::FromArgb(90, 255, 255, 255)
+  $b2.SurroundColors = @([System.Drawing.Color]::FromArgb(0, 255, 255, 255))
+  $g.FillPath($b2, $sp2)
+  $b2.Dispose(); $sp2.Dispose()
+  $g.ResetClip()
+  $ringClip.Dispose()
 
   # 白抜きのピラミッドマーク
   $T = New-Object System.Drawing.PointF(($S*0.50), ($S*0.20))
