@@ -53,7 +53,7 @@
           Promise.all(workers).then(function () {
             var tasks = [];
             results.forEach(function (r) { if (r && r.ok && r.tasks) tasks = tasks.concat(r.tasks); });
-            var roomsBrief = rooms.map(function (r) { return { name: r.name, lastUpdate: r.last_update_time || 0, msgNum: r.message_num || 0 }; });
+            var roomsBrief = rooms.map(function (r) { return { name: r.name, lastUpdate: r.last_update_time || 0 }; });
             onOk({ ok: true, me: list.me, tasks: tasks, rooms: roomsBrief, cached: false });
           }).catch(function (e) { onFail(e); });
         }).catch(function (e) { onFail(e); });
@@ -620,25 +620,16 @@
     function buildRoomFilter() { updateRoomBtn(); if (!document.getElementById('roomMenu').classList.contains('hidden')) renderRoomList(); }
 
     /* ---- 担当者フィルタ（担当者別ビュー専用。ルームのプルダウンの代わり） ---- */
-    // ルーム名 → メッセージ数（やり取り量）の対応表
-    function roomMsgMap() { var m = {}; roomsBrief.forEach(function (r) { m[r.name] = r.msgNum || 0; }); return m; }
-    // 担当者ごとの「やり取り量」= その担当者のタスクがある“別々のルーム”のメッセージ数合計
-    function assigneeVolumes(tasks) {
-      var msg = roomMsgMap(), vol = {}, seen = {};
-      tasks.forEach(function (t) {
-        var k = t.assigneeName || '(未設定)';
-        if (!vol[k]) { vol[k] = 0; seen[k] = {}; }
-        if (t.roomName && !seen[k][t.roomName]) { seen[k][t.roomName] = 1; vol[k] += (msg[t.roomName] || 0); }
-      });
-      return vol;
+    // 担当者別ビューでは自分のタスクは対象外
+    function boardTasks() {
+      return currentTasks().filter(function (t) { return String(t.assigneeId) !== String(myId); });
     }
-    // 現在のタスクに存在する担当者を、やり取り量の多い順に並べる
+    // 現在のタスクに存在する担当者を、やり取り（タスク件数）の多い順に並べる
     function presentAssigneesOrdered() {
       var cnt = {};
-      currentTasks().forEach(function (t) { var k = t.assigneeName || '(未設定)'; cnt[k] = (cnt[k] || 0) + 1; });
-      var vol = assigneeVolumes(currentTasks());
+      boardTasks().forEach(function (t) { var k = t.assigneeName || '(未設定)'; cnt[k] = (cnt[k] || 0) + 1; });
       return Object.keys(cnt)
-        .sort(function (a, b) { return (vol[b] || 0) - (vol[a] || 0) || cnt[b] - cnt[a] || a.localeCompare(b, 'ja'); })
+        .sort(function (a, b) { return cnt[b] - cnt[a] || a.localeCompare(b, 'ja'); })
         .map(function (n) { return { name: n, count: cnt[n] }; });
     }
     function assigneeVisible(name) {
@@ -749,8 +740,10 @@
           if (kind === 'memo' && !t.isMemo) return false;
         }
         // 担当者別ビューは担当者フィルタ、それ以外はルームフィルタで絞る
-        if (view === 'assignee') { if (!assigneeVisible(t.assigneeName || '(未設定)')) return false; }
-        else { if (!roomVisible(t.roomName)) return false; }
+        if (view === 'assignee') {
+          if (String(t.assigneeId) === String(myId)) return false; // 自分のタスクは担当者別では出さない
+          if (!assigneeVisible(t.assigneeName || '(未設定)')) return false;
+        } else { if (!roomVisible(t.roomName)) return false; }
         if (q) { if ((t.body + ' ' + t.roomName + ' ' + t.assigneeName).toLowerCase().indexOf(q) === -1) return false; }
         return true;
       });
@@ -997,13 +990,12 @@
       var map = {};
       tasks.forEach(function (t) { var k = t.assigneeName || '(未設定)'; (map[k] = map[k] || []).push(t); });
       var pos = {}; assigneeOrder.forEach(function (n, i) { pos[n] = i; });
-      var vol = assigneeVolumes(tasks); // 担当者ごとのやり取り量（ルームのメッセージ数合計）
       var keys = Object.keys(map).sort(function (a, b) {
         var pa = pos[a], pb = pos[b], ha = pa !== undefined, hb = pb !== undefined;
         if (ha && hb) return pa - pb;       // 手動順を優先
         if (ha) return -1;
         if (hb) return 1;
-        return (vol[b] || 0) - (vol[a] || 0) || map[b].length - map[a].length; // 残りはやり取りの多い順→件数順
+        return map[b].length - map[a].length || a.localeCompare(b, 'ja'); // 残りはやり取り（件数）の多い順
       });
       var board = document.createElement('div'); board.className = 'board';
       keys.forEach(function (k) {
