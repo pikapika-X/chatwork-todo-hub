@@ -155,6 +155,7 @@ async function apiRoomList(token) {
     icon_path: r.icon_path || '',
     last_update_time: r.last_update_time || 0
   }));
+  console.log('roomList rooms=' + slim.length);
   return { ok: true, me: publicMe(me), rooms: slim };
 }
 
@@ -164,6 +165,7 @@ async function apiRoomTasksBatch(token, rooms, force, ctx) {
   const dg = await tokenDigest(token);
   const cache = caches.default;
   const tasks = [];
+  const stats = { rooms: (rooms || []).length, cacheHit: 0, c200: 0, c204: 0, c403: 0, c404: 0, c429: 0, c5xx: 0, other: 0 };
 
   await mapLimit(rooms || [], 6, async (room) => {
     const lut = room.last_update_time || 0;
@@ -175,12 +177,15 @@ async function apiRoomTasksBatch(token, rooms, force, ctx) {
       if (hit) {
         const arr = await hit.json();
         arr.forEach(t => tasks.push(t));
+        stats.cacheHit++;
         return;
       }
     }
 
     const res = await cwGet(token, '/rooms/' + room.room_id + '/tasks?status=open');
     const code = res.status;
+    if (code === 200) stats.c200++; else if (code === 204) stats.c204++; else if (code === 403) stats.c403++;
+    else if (code === 404) stats.c404++; else if (code === 429) stats.c429++; else if (code >= 500) stats.c5xx++; else stats.other++;
     if (code === 429 || code >= 500) return; // 混雑/一時エラー → スキップ（キャッシュしない）
 
     let shaped = [];
@@ -208,6 +213,7 @@ async function apiRoomTasksBatch(token, rooms, force, ctx) {
     ctx.waitUntil(cache.put(cacheKey, resp)); // 6時間保持
   });
 
+  console.log('roomTasksBatch', JSON.stringify(stats), 'tasks=' + tasks.length);
   return { ok: true, tasks: tasks };
 }
 
