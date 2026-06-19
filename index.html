@@ -53,7 +53,7 @@
           Promise.all(workers).then(function () {
             var tasks = [];
             results.forEach(function (r) { if (r && r.ok && r.tasks) tasks = tasks.concat(r.tasks); });
-            var roomsBrief = rooms.map(function (r) { return { name: r.name, lastUpdate: r.last_update_time || 0 }; });
+            var roomsBrief = rooms.map(function (r) { return { name: r.name, lastUpdate: r.last_update_time || 0, msgNum: r.message_num || 0, type: r.type || '' }; });
             onOk({ ok: true, me: list.me, tasks: tasks, rooms: roomsBrief, cached: false });
           }).catch(function (e) { onFail(e); });
         }).catch(function (e) { onFail(e); });
@@ -203,11 +203,11 @@
     .board{display:flex;gap:10px;overflow-x:auto;padding-bottom:10px;align-items:flex-start}
     .col{flex:0 0 188px;width:188px;min-width:0;max-width:188px;display:flex;flex-direction:column;gap:7px}
     .col-h{position:sticky;top:0;background:var(--paper);padding:3px 2px;border-bottom:2px solid var(--green);
-      font-weight:800;font-size:12px;display:flex;justify-content:space-between;align-items:center}
-    .col-h .cnt{color:var(--sub);font-size:11px;font-weight:700}
-    .col-h{cursor:grab}
-    .col-h:active{cursor:grabbing}
-    .board .colph{flex:0 0 4px;align-self:stretch;background:var(--green);border-radius:2px;min-height:60px}
+      font-weight:800;font-size:12px;display:flex;gap:4px;align-items:center}
+    .col-h .cnm{flex:1 1 auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+    .col-h .chat{flex:0 0 auto;color:var(--green);font-size:10px;font-weight:800;background:var(--green-s);
+      border-radius:5px;padding:1px 5px}
+    .col-h .cnt{flex:0 0 auto;color:var(--sub);font-size:11px;font-weight:700}
     .board .card{padding:7px 8px;cursor:default;min-width:0;max-width:100%}
     .board .body{-webkit-line-clamp:2;font-size:12px;overflow-wrap:anywhere}
 
@@ -371,9 +371,7 @@
     var ORD = { task: {}, memo: {}, bm: {} };  // colId -> [taskId,...] 手動並び順
     var NOTE_KEY = 'cwTodoNote';
     var THEME_KEY = 'cwTodoTheme';
-    var ASSIGNEE_ORDER_KEY = 'cwTodoAssigneeOrder';
-    var assigneeOrder = [];      // 担当者列の手動並び順（名前の配列）
-    var draggingAssignee = null;
+    var ASSIGNEE_ORDER_KEY = 'cwTodoAssigneeOrder'; // 旧：手動並び順（廃止。起動時に掃除する）
     var ROOMS_KEY = 'cwTodoRooms';
     var selectedRooms = 'all';   // 'all' = 全表示、または表示する部屋名の配列
     var ASSIGNEES_KEY = 'cwTodoAssignees';
@@ -422,7 +420,7 @@
       ORD.bm = readJson(ORD_KEYS.bm, {});
       reminders = readJson(REM_KEY, []);
       bookmarks = readJson(BM_KEY, []);
-      assigneeOrder = readJson(ASSIGNEE_ORDER_KEY, []);
+      localStorage.removeItem(ASSIGNEE_ORDER_KEY); // 手動並べ替えは廃止。古い保存順が残っていると並びが固定されるため消す
       selectedRooms = readJson(ROOMS_KEY, 'all');
       selectedAssignees = readJson(ASSIGNEES_KEY, 'all');
       var showAllBox = document.getElementById('showAll');
@@ -624,31 +622,20 @@
     function boardTasks() {
       return currentTasks().filter(function (t) { return String(t.assigneeId) !== String(myId); });
     }
-    // 「私とその人のやり取りの多さ」= 私がその人に振ったタスク＋その人が私に振ったタスク（双方向）
-    function interactionScores() {
-      var all = cache.room || [];
-      var mine = (me && me.name) || '';
-      var score = {};
-      all.forEach(function (t) {
-        var by = t.assignedByName || '';
-        if (String(t.assigneeId) === String(myId)) {
-          // その人 → 私（私が担当のタスクを、その人が振った）
-          if (by && by !== mine) score[by] = (score[by] || 0) + 1;
-        } else if (mine && by === mine) {
-          // 私 → その人（私が振ったタスク）
-          var a = t.assigneeName || '(未設定)';
-          score[a] = (score[a] || 0) + 1;
-        }
-      });
-      return score;
+    // 「私とその人のやり取りの多さ」= その人との1on1（ダイレクト）チャットのメッセージ数
+    // ダイレクトチャットのルーム名 = 相手の表示名。タスクの担当者名と突き合わせる。
+    function chatScores() {
+      var m = {};
+      roomsBrief.forEach(function (r) { if (r.type === 'direct') m[r.name] = r.msgNum || 0; });
+      return m;
     }
-    // 現在のタスクに存在する担当者を、やり取りの多い（双方向タスク数）順に並べる
+    // 現在のタスクに存在する担当者を、1on1チャットのメッセージ数が多い順に並べる
     function presentAssigneesOrdered() {
-      var cnt = {}, score = interactionScores();
+      var cnt = {}, score = chatScores();
       boardTasks().forEach(function (t) { var k = t.assigneeName || '(未設定)'; cnt[k] = (cnt[k] || 0) + 1; });
       return Object.keys(cnt)
         .sort(function (a, b) { return (score[b] || 0) - (score[a] || 0) || cnt[b] - cnt[a] || a.localeCompare(b, 'ja'); })
-        .map(function (n) { return { name: n, count: cnt[n] }; });
+        .map(function (n) { return { name: n, count: cnt[n], score: score[n] || 0 }; });
     }
     function assigneeVisible(name) {
       if (selectedAssignees === 'all') return true;
@@ -687,7 +674,8 @@
         var cb = document.createElement('input'); cb.type = 'checkbox'; cb.checked = assigneeVisible(r.name);
         cb.onchange = function () { toggleAssignee(r.name, cb.checked); };
         var nm = document.createElement('span'); nm.textContent = r.name;
-        var cn = document.createElement('span'); cn.className = 'rcount'; cn.textContent = r.count;
+        var cn = document.createElement('span'); cn.className = 'rcount'; cn.title = '1on1チャットのメッセージ数 / タスク件数';
+        cn.textContent = '💬' + r.score + '・' + r.count;
         lb.appendChild(cb); lb.appendChild(nm); lb.appendChild(cn);
         list.appendChild(lb);
       });
@@ -1003,82 +991,28 @@
       return idx;
     }
 
-    /* ---- 担当者別：コンパクトボード（列を左右に並べ替え可） ---- */
+    /* ---- 担当者別：コンパクトボード（1on1チャットの会話量が多い順・常に自動） ---- */
     function renderBoard(content, tasks) {
       var map = {};
       tasks.forEach(function (t) { var k = t.assigneeName || '(未設定)'; (map[k] = map[k] || []).push(t); });
-      var pos = {}; assigneeOrder.forEach(function (n, i) { pos[n] = i; });
-      var score = interactionScores(); // 私とその人の双方向タスク数
+      var score = chatScores(); // 担当者名 → 1on1チャットのメッセージ数
+      // 並び順：1on1メッセージ数が多い順 → タスク件数 → 名前（手動並べ替えは廃止）
       var keys = Object.keys(map).sort(function (a, b) {
-        var pa = pos[a], pb = pos[b], ha = pa !== undefined, hb = pb !== undefined;
-        if (ha && hb) return pa - pb;       // 手動順を優先
-        if (ha) return -1;
-        if (hb) return 1;
-        return (score[b] || 0) - (score[a] || 0) || map[b].length - map[a].length || a.localeCompare(b, 'ja'); // 私とのやり取りが多い順
+        return (score[b] || 0) - (score[a] || 0) || map[b].length - map[a].length || a.localeCompare(b, 'ja');
       });
       var board = document.createElement('div'); board.className = 'board';
       keys.forEach(function (k) {
         var col = document.createElement('div'); col.className = 'col'; col.dataset.assignee = k;
-        var h = document.createElement('div'); h.className = 'col-h'; h.draggable = true; h.title = 'ドラッグで左右に並べ替え';
-        var nm = document.createElement('span'); nm.textContent = k;
-        var cn = document.createElement('span'); cn.className = 'cnt'; cn.textContent = map[k].length;
-        h.appendChild(nm); h.appendChild(cn); col.appendChild(h);
-        h.addEventListener('dragstart', function (e) {
-          draggingAssignee = k;
-          try { e.dataTransfer.setData('text/assignee', k); e.dataTransfer.effectAllowed = 'move'; } catch (_) {}
-        });
-        h.addEventListener('dragend', function () { draggingAssignee = null; removeColPh(); });
+        var h = document.createElement('div'); h.className = 'col-h';
+        var nm = document.createElement('span'); nm.className = 'cnm'; nm.textContent = k;
+        var sc = document.createElement('span'); sc.className = 'chat'; sc.title = 'あなたとの1on1チャットのメッセージ数（並び順の基準）';
+        sc.textContent = '💬' + (score[k] || 0);
+        var cn = document.createElement('span'); cn.className = 'cnt'; cn.title = 'タスク件数'; cn.textContent = map[k].length;
+        h.appendChild(nm); h.appendChild(sc); h.appendChild(cn); col.appendChild(h);
         map[k].forEach(function (t) { col.appendChild(taskCard(t)); });
         board.appendChild(col);
       });
-      board.addEventListener('dragover', function (e) {
-        if (!draggingAssignee) return; // カードのドラッグには干渉しない
-        e.preventDefault();
-        try { e.dataTransfer.dropEffect = 'move'; } catch (_) {}
-        positionColPh(board, e.clientX);
-      });
-      board.addEventListener('drop', function (e) {
-        if (!draggingAssignee) return;
-        e.preventDefault();
-        var at = colPhIndex(board); removeColPh();
-        var names = Array.prototype.map.call(board.querySelectorAll('.col'), function (c) { return c.dataset.assignee; })
-          .filter(function (n) { return n !== draggingAssignee; });
-        if (at < 0 || at > names.length) at = names.length;
-        names.splice(at, 0, draggingAssignee);
-        assigneeOrder = names;
-        localStorage.setItem(ASSIGNEE_ORDER_KEY, JSON.stringify(assigneeOrder));
-        draggingAssignee = null;
-        render();
-      });
       content.appendChild(board);
-    }
-
-    /* 担当者列の挿入位置インジケータ（縦線） */
-    var _cph = null;
-    function ensureCph() { if (!_cph) { _cph = document.createElement('div'); _cph.className = 'colph'; } return _cph; }
-    function removeColPh() { if (_cph && _cph.parentNode) _cph.parentNode.removeChild(_cph); }
-    function positionColPh(board, x) {
-      var ph = ensureCph();
-      var cols = Array.prototype.slice.call(board.querySelectorAll('.col'));
-      var ref = null;
-      for (var i = 0; i < cols.length; i++) {
-        if (cols[i].dataset.assignee === draggingAssignee) continue;
-        var r = cols[i].getBoundingClientRect();
-        if (x < r.left + r.width / 2) { ref = cols[i]; break; }
-      }
-      if (ref) board.insertBefore(ph, ref); else board.appendChild(ph);
-    }
-    function colPhIndex(board) {
-      var nodes = board.childNodes, idx = 0;
-      for (var i = 0; i < nodes.length; i++) {
-        var n = nodes[i];
-        if (n === _cph) return idx;
-        if (n.classList && n.classList.contains('col')) {
-          if (n.dataset.assignee === draggingAssignee) continue;
-          idx++;
-        }
-      }
-      return idx;
     }
 
     /* ---- 共通カード ---- */

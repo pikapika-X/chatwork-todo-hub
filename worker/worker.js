@@ -170,7 +170,8 @@ async function apiRoomList(token) {
     name: r.name,
     icon_path: r.icon_path || '',
     last_update_time: r.last_update_time || 0,
-    message_num: r.message_num || 0
+    message_num: r.message_num || 0,
+    type: r.type || '' // 'my' | 'direct' | 'group'。direct=1on1チャット
   }));
   console.log('roomList rooms=' + slim.length);
   return { ok: true, me: publicMe(me), rooms: slim };
