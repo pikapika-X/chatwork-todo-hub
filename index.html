@@ -387,7 +387,7 @@
     function applyTheme(t) {
       var dark = (t === 'dark');
       document.documentElement.setAttribute('data-theme', dark ? 'dark' : 'light');
-      localStorage.setItem(THEME_KEY, dark ? 'dark' : 'light');
+      lsSet(THEME_KEY, dark ? 'dark' : 'light');
       var b = document.getElementById('themeBtn');
       if (b) b.textContent = dark ? '☀ ライトモードに変更' : '🌙 ダークモードに変更';
     }
@@ -407,26 +407,11 @@
     }
 
     document.addEventListener('DOMContentLoaded', function () {
-      applyTheme(localStorage.getItem(THEME_KEY) === 'dark' ? 'dark' : 'light');
       applyLogo();
-      COLS.task = readJson(COL_KEYS.task, null) || readJson(COL_KEY, []); // 旧データはタスク用へ移行
-      COLS.memo = readJson(COL_KEYS.memo, []);
-      COLS.bm = readJson(COL_KEYS.bm, []);
-      ASG.task = readJson(ASG_KEYS.task, null) || readJson(ASSIGN_KEY, {});
-      ASG.memo = readJson(ASG_KEYS.memo, {});
-      ASG.bm = readJson(ASG_KEYS.bm, {});
-      ORD.task = readJson(ORD_KEYS.task, {});
-      ORD.memo = readJson(ORD_KEYS.memo, {});
-      ORD.bm = readJson(ORD_KEYS.bm, {});
-      reminders = readJson(REM_KEY, []);
-      bookmarks = readJson(BM_KEY, []);
       localStorage.removeItem(ASSIGNEE_ORDER_KEY); // 手動並べ替えは廃止。古い保存順が残っていると並びが固定されるため消す
-      selectedRooms = readJson(ROOMS_KEY, 'all');
-      selectedAssignees = readJson(ASSIGNEES_KEY, 'all');
-      var showAllBox = document.getElementById('showAll');
-      if (showAllBox) showAllBox.checked = (localStorage.getItem(SHOWALL_KEY) === '1');
+      loadLocalState();                            // 同期キーを読み込む（テーマ適用もこの中で実行）
       var note = document.getElementById('note');
-      if (note) { note.value = localStorage.getItem(NOTE_KEY) || ''; note.addEventListener('input', function () { localStorage.setItem(NOTE_KEY, note.value); }); }
+      if (note) note.addEventListener('input', function () { lsSet(NOTE_KEY, note.value); });
       initRemZone();
       setInterval(checkReminders, 30000);
       checkReminders();
@@ -436,6 +421,13 @@
         var r = document.getElementById('roomMenu'); if (r) r.classList.add('hidden');
         var a = document.getElementById('assigneeMenu'); if (a) a.classList.add('hidden');
       });
+      // 画面に戻ってきたら別端末の変更を取り込む（自分の未送信分は先に保存）
+      document.addEventListener('visibilitychange', function () {
+        if (document.hidden || !token) return;
+        if (pushTimer) flushPush();
+        pullSettings(function () { if (cache.room) { buildRoomFilter(); buildAssigneeFilter(); render(); } });
+      });
+      window.addEventListener('beforeunload', function () { if (pushTimer) flushPush(); }); // 離脱前に未送信分を保存
       token = localStorage.getItem(TOKEN_KEY) || '';
       if (token) connect();
     });
@@ -463,12 +455,136 @@
     function activeColumns() { return COLS[activeScope()]; }
     function activeAssign() { return ASG[activeScope()]; }
     function activeOrder() { return ORD[activeScope()]; }
-    function saveCols() { var s = activeScope(); localStorage.setItem(COL_KEYS[s], JSON.stringify(COLS[s])); }
-    function saveAssign() { var s = activeScope(); localStorage.setItem(ASG_KEYS[s], JSON.stringify(ASG[s])); }
-    function saveOrder() { var s = activeScope(); localStorage.setItem(ORD_KEYS[s], JSON.stringify(ORD[s])); }
+    function saveCols() { var s = activeScope(); lsSet(COL_KEYS[s], JSON.stringify(COLS[s])); }
+    function saveAssign() { var s = activeScope(); lsSet(ASG_KEYS[s], JSON.stringify(ASG[s])); }
+    function saveOrder() { var s = activeScope(); lsSet(ORD_KEYS[s], JSON.stringify(ORD[s])); }
     function getBaseline() { var v = localStorage.getItem(BASE_KEY); return v ? Number(v) : null; }
-    function setBaseline(v) { localStorage.setItem(BASE_KEY, String(v)); }
-    function saveShowAll() { localStorage.setItem(SHOWALL_KEY, document.getElementById('showAll').checked ? '1' : '0'); render(); }
+    function setBaseline(v) { localStorage.setItem(BASE_KEY, String(v)); } // 起点は端末ごと（同期しない）
+    function saveShowAll() { lsSet(SHOWALL_KEY, document.getElementById('showAll').checked ? '1' : '0'); render(); }
+
+    /* ====== 端末間 設定同期（同じトークン＝同じカスタマイズ。中身はこの端末で暗号化） ======
+       サーバ(Worker+KV)には暗号文しか置かない。鍵は SHA-256(token) なので、トークンを知る本人だけが復号できる。 */
+    var SYNC_KEYS = [ // 同期するキー。トークン・起点・旧データは含めない
+      THEME_KEY, NOTE_KEY, SHOWALL_KEY, ROOMS_KEY, ASSIGNEES_KEY, REM_KEY, BM_KEY,
+      COL_KEYS.task, COL_KEYS.memo, COL_KEYS.bm,
+      ASG_KEYS.task, ASG_KEYS.memo, ASG_KEYS.bm,
+      ORD_KEYS.task, ORD_KEYS.memo, ORD_KEYS.bm
+    ];
+    var syncReady = false; // PULL完了まで PUSH しない（空ローカルでサーバを潰さないため）
+    var pushTimer = null;
+    var lastSyncAt = 0;    // 最後に反映/保存したサーバ updatedAt（後勝ち判定用）
+
+    // 同期キーへの書き込みラッパ。書いたら PUSH を予約する
+    function lsSet(k, v) { localStorage.setItem(k, v); schedulePush(); }
+
+    // ---- 暗号化（AES-GCM, 鍵 = SHA-256(token)）----
+    var _cryptoKey = null;
+    function getKey() {
+      if (_cryptoKey) return Promise.resolve(_cryptoKey);
+      return crypto.subtle.digest('SHA-256', new TextEncoder().encode(token))
+        .then(function (raw) { return crypto.subtle.importKey('raw', raw, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']); })
+        .then(function (key) { _cryptoKey = key; return key; });
+    }
+    function bytesToB64(bytes) {
+      var bin = '', CH = 0x8000;
+      for (var i = 0; i < bytes.length; i += CH) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + CH));
+      return btoa(bin);
+    }
+    function b64ToBytes(b64) {
+      var bin = atob(b64), n = bin.length, out = new Uint8Array(n);
+      for (var i = 0; i < n; i++) out[i] = bin.charCodeAt(i);
+      return out;
+    }
+    function encryptStr(plain) {
+      return getKey().then(function (key) {
+        var iv = crypto.getRandomValues(new Uint8Array(12));
+        return crypto.subtle.encrypt({ name: 'AES-GCM', iv: iv }, key, new TextEncoder().encode(plain))
+          .then(function (ct) {
+            var c = new Uint8Array(ct), buf = new Uint8Array(iv.length + c.length);
+            buf.set(iv, 0); buf.set(c, iv.length);
+            return bytesToB64(buf);
+          });
+      });
+    }
+    function decryptStr(b64) {
+      return getKey().then(function (key) {
+        var buf = b64ToBytes(b64), iv = buf.subarray(0, 12), ct = buf.subarray(12);
+        return crypto.subtle.decrypt({ name: 'AES-GCM', iv: iv }, key, ct)
+          .then(function (pt) { return new TextDecoder().decode(pt); });
+      });
+    }
+
+    // ---- スナップショットの収集 / 適用 ----
+    function gatherSettings() {
+      var o = {};
+      SYNC_KEYS.forEach(function (k) { var v = localStorage.getItem(k); if (v !== null) o[k] = v; });
+      return o;
+    }
+    function applySettings(o) {
+      SYNC_KEYS.forEach(function (k) {
+        if (Object.prototype.hasOwnProperty.call(o, k)) localStorage.setItem(k, o[k]);
+        else localStorage.removeItem(k);
+      });
+    }
+
+    // ---- PUSH（変更を1.5秒まとめてサーバへ。後勝ち）----
+    function schedulePush() {
+      if (!token || !syncReady) return;
+      if (pushTimer) clearTimeout(pushTimer);
+      pushTimer = setTimeout(flushPush, 1500);
+    }
+    function flushPush() {
+      if (pushTimer) { clearTimeout(pushTimer); pushTimer = null; }
+      if (!token || !syncReady) return;
+      var snapshot = JSON.stringify(gatherSettings());
+      encryptStr(snapshot).then(function (payload) {
+        google.script.run
+          .withSuccessHandler(function (r) { if (r && r.ok && r.updatedAt) lastSyncAt = r.updatedAt; })
+          .withFailureHandler(function () {})
+          .apiSaveSettings(token, payload, Date.now());
+      }).catch(function () {});
+    }
+
+    // ---- PULL（接続時などにサーバ設定を取得して反映。無ければ現在のローカルを初期登録）----
+    function pullSettings(done) {
+      function finish() { syncReady = true; if (done) done(); }
+      if (!token) { finish(); return; }
+      google.script.run
+        .withSuccessHandler(function (r) {
+          if (!r || !r.ok) { finish(); return; }
+          if (!r.found) { syncReady = true; flushPush(); if (done) done(); return; } // 初回：今のローカルを種に登録
+          if (!r.updatedAt || r.updatedAt <= lastSyncAt) { finish(); return; }        // サーバが新しくなければ何もしない（自端末の方が新しい）
+          decryptStr(r.payload).then(function (json) {
+            try { applySettings(JSON.parse(json)); loadLocalState(); lastSyncAt = r.updatedAt; } catch (e) {}
+            finish();
+          }).catch(function () { finish(); }); // 復号失敗（トークン変更等）はローカルのまま
+        })
+        .withFailureHandler(function () { finish(); })
+        .apiLoadSettings(token);
+    }
+
+    // ---- 同期キーを変数・UIへ読み込む（起動時とPULL後に使用）----
+    function loadLocalState() {
+      COLS.task = readJson(COL_KEYS.task, null) || readJson(COL_KEY, []); // 旧データはタスク用へ移行
+      COLS.memo = readJson(COL_KEYS.memo, []);
+      COLS.bm = readJson(COL_KEYS.bm, []);
+      ASG.task = readJson(ASG_KEYS.task, null) || readJson(ASSIGN_KEY, {});
+      ASG.memo = readJson(ASG_KEYS.memo, {});
+      ASG.bm = readJson(ASG_KEYS.bm, {});
+      ORD.task = readJson(ORD_KEYS.task, {});
+      ORD.memo = readJson(ORD_KEYS.memo, {});
+      ORD.bm = readJson(ORD_KEYS.bm, {});
+      reminders = readJson(REM_KEY, []);
+      bookmarks = readJson(BM_KEY, []);
+      selectedRooms = readJson(ROOMS_KEY, 'all');
+      selectedAssignees = readJson(ASSIGNEES_KEY, 'all');
+      var showAllBox = document.getElementById('showAll');
+      if (showAllBox) showAllBox.checked = (localStorage.getItem(SHOWALL_KEY) === '1');
+      var note = document.getElementById('note');
+      if (note) note.value = localStorage.getItem(NOTE_KEY) || '';
+      applyTheme(localStorage.getItem(THEME_KEY) === 'dark' ? 'dark' : 'light');
+      updateRemCount();
+    }
 
     function saveToken() {
       var t = document.getElementById('tokenInput').value.trim();
@@ -491,7 +607,7 @@
           document.getElementById('who').textContent = me.name + ' さん';
           document.getElementById('remZone').classList.remove('hidden');
           updateRemCount();
-          switchView('mine');
+          pullSettings(function () { switchView('mine'); }); // 先に別端末の設定を取り込んでから表示
         })
         .withFailureHandler(function (e) { setTokenMsg(String(e && e.message ? e.message : e)); })
         .apiInit(token);
@@ -518,7 +634,7 @@
       else load(false);
     }
 
-    function refresh() { load(true); }
+    function refresh() { pullSettings(function () { load(true); }); } // 更新ボタン：設定同期＋タスク再取得
 
     function load(force) {
       if (!force && cache.room) { afterData(); return; }
@@ -558,7 +674,7 @@
       if (selectedRooms === 'all') return true;
       return Array.isArray(selectedRooms) && selectedRooms.indexOf(name) !== -1;
     }
-    function saveRooms() { localStorage.setItem(ROOMS_KEY, JSON.stringify(selectedRooms)); }
+    function saveRooms() { lsSet(ROOMS_KEY, JSON.stringify(selectedRooms)); }
     function toggleRoomMenu(e) {
       if (e) e.stopPropagation();
       var m = document.getElementById('roomMenu');
@@ -641,7 +757,7 @@
       if (selectedAssignees === 'all') return true;
       return Array.isArray(selectedAssignees) && selectedAssignees.indexOf(name) !== -1;
     }
-    function saveAssignees() { localStorage.setItem(ASSIGNEES_KEY, JSON.stringify(selectedAssignees)); }
+    function saveAssignees() { lsSet(ASSIGNEES_KEY, JSON.stringify(selectedAssignees)); }
     function toggleAssigneeMenu(e) {
       if (e) e.stopPropagation();
       var m = document.getElementById('assigneeMenu');
@@ -789,7 +905,7 @@
           body: t.body, isMemo: t.isMemo, link: t.link, savedAt: Date.now()
         });
       }
-      localStorage.setItem(BM_KEY, JSON.stringify(bookmarks));
+      lsSet(BM_KEY, JSON.stringify(bookmarks));
     }
 
     /* ---- 自分のタスク：カスタムカンバン ---- */
@@ -1139,14 +1255,14 @@
         room: pendingRemTask.roomName || '', body: (cleanBody(pendingRemTask.body) || '').slice(0, 120),
         time: when, fired: false
       });
-      localStorage.setItem(REM_KEY, JSON.stringify(reminders));
+      lsSet(REM_KEY, JSON.stringify(reminders));
       closeRemDialog(); updateRemCount();
     }
     function requestNotify() { try { if ('Notification' in window && Notification.permission === 'default') Notification.requestPermission(); } catch (_) {} }
     function checkReminders() {
       var now = Date.now(), changed = false;
       reminders.forEach(function (r) { if (!r.fired && r.time <= now) { fireReminder(r); r.fired = true; changed = true; } });
-      if (changed) { localStorage.setItem(REM_KEY, JSON.stringify(reminders)); updateRemCount(); }
+      if (changed) { lsSet(REM_KEY, JSON.stringify(reminders)); updateRemCount(); }
     }
     function fireReminder(r) {
       var title = '⏰ リマインド' + (r.room ? '：' + r.room : '');
@@ -1176,7 +1292,7 @@
     }
     function cancelReminder(id) {
       reminders = reminders.filter(function (r) { return r.id !== id; });
-      localStorage.setItem(REM_KEY, JSON.stringify(reminders));
+      lsSet(REM_KEY, JSON.stringify(reminders));
       updateRemCount(); renderRemList();
     }
   </script>
