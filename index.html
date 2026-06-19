@@ -53,7 +53,7 @@
           Promise.all(workers).then(function () {
             var tasks = [];
             results.forEach(function (r) { if (r && r.ok && r.tasks) tasks = tasks.concat(r.tasks); });
-            var roomsBrief = rooms.map(function (r) { return { name: r.name, lastUpdate: r.last_update_time || 0 }; });
+            var roomsBrief = rooms.map(function (r) { return { name: r.name, lastUpdate: r.last_update_time || 0, msgNum: r.message_num || 0 }; });
             onOk({ ok: true, me: list.me, tasks: tasks, rooms: roomsBrief, cached: false });
           }).catch(function (e) { onFail(e); });
         }).catch(function (e) { onFail(e); });
@@ -304,7 +304,7 @@
         <option value="new">新着順</option>
         <option value="old">古い順</option>
       </select>
-      <div class="roomsel">
+      <div class="roomsel" id="roomSel">
         <button id="roomBtn" class="ghost" onclick="toggleRoomMenu(event)">ルーム：全部 ▾</button>
         <div id="roomMenu" class="roommenu hidden" onclick="event.stopPropagation()">
           <div class="roommenu-acts">
@@ -312,6 +312,16 @@
             <button class="ghost" onclick="roomDeselectAll()">全解除</button>
           </div>
           <div id="roomList" class="roomlist"></div>
+        </div>
+      </div>
+      <div class="roomsel hidden" id="assigneeSel">
+        <button id="assigneeBtn" class="ghost" onclick="toggleAssigneeMenu(event)">担当者：全部 ▾</button>
+        <div id="assigneeMenu" class="roommenu hidden" onclick="event.stopPropagation()">
+          <div class="roommenu-acts">
+            <button class="ghost" onclick="assigneeSelectAll()">全選択</button>
+            <button class="ghost" onclick="assigneeDeselectAll()">全解除</button>
+          </div>
+          <div id="assigneeList" class="roomlist"></div>
         </div>
       </div>
       <label class="newonly" title="過去のタスクも含めてすべて表示"><input type="checkbox" id="showAll" onchange="saveShowAll()"> 全部表示</label>
@@ -366,6 +376,8 @@
     var draggingAssignee = null;
     var ROOMS_KEY = 'cwTodoRooms';
     var selectedRooms = 'all';   // 'all' = 全表示、または表示する部屋名の配列
+    var ASSIGNEES_KEY = 'cwTodoAssignees';
+    var selectedAssignees = 'all'; // 担当者別ビューの表示フィルタ。'all' または表示する担当者名の配列
     var draggingColId = null;    // インデックス列の並べ替え中の列ID
     var REM_KEY = 'cwTodoReminders';
     var reminders = [];
@@ -412,6 +424,7 @@
       bookmarks = readJson(BM_KEY, []);
       assigneeOrder = readJson(ASSIGNEE_ORDER_KEY, []);
       selectedRooms = readJson(ROOMS_KEY, 'all');
+      selectedAssignees = readJson(ASSIGNEES_KEY, 'all');
       var showAllBox = document.getElementById('showAll');
       if (showAllBox) showAllBox.checked = (localStorage.getItem(SHOWALL_KEY) === '1');
       var note = document.getElementById('note');
@@ -423,6 +436,7 @@
       document.addEventListener('click', function () {
         var m = document.getElementById('userMenu'); if (m) m.classList.add('hidden');
         var r = document.getElementById('roomMenu'); if (r) r.classList.add('hidden');
+        var a = document.getElementById('assigneeMenu'); if (a) a.classList.add('hidden');
       });
       token = localStorage.getItem(TOKEN_KEY) || '';
       if (token) connect();
@@ -501,6 +515,7 @@
       var tabs = document.querySelectorAll('.tab');
       for (var i = 0; i < tabs.length; i++) tabs[i].classList.toggle('active', tabs[i].dataset.view === v);
       document.getElementById('addColBtn').classList.toggle('hidden', !(v === 'mine' || v === 'bookmark'));
+      updateFilterVisibility();
       if (v === 'bookmark') { buildRoomFilter(); render(); } // ローカル保存なので取得不要
       else load(false);
     }
@@ -525,7 +540,7 @@
       }).withFailureHandler(failLoad).apiRoomTasks(token, !!force);
     }
 
-    function afterData() { buildRoomFilter(); render(); }
+    function afterData() { buildRoomFilter(); buildAssigneeFilter(); updateFilterVisibility(); render(); }
 
     function failLoad(e) {
       showLoading(false);
@@ -604,6 +619,88 @@
     // 旧名のまま、データ更新時に呼ばれる（ボタン表示＋メニュー内容を更新）
     function buildRoomFilter() { updateRoomBtn(); if (!document.getElementById('roomMenu').classList.contains('hidden')) renderRoomList(); }
 
+    /* ---- 担当者フィルタ（担当者別ビュー専用。ルームのプルダウンの代わり） ---- */
+    // ルーム名 → メッセージ数（やり取り量）の対応表
+    function roomMsgMap() { var m = {}; roomsBrief.forEach(function (r) { m[r.name] = r.msgNum || 0; }); return m; }
+    // 担当者ごとの「やり取り量」= その担当者のタスクがある“別々のルーム”のメッセージ数合計
+    function assigneeVolumes(tasks) {
+      var msg = roomMsgMap(), vol = {}, seen = {};
+      tasks.forEach(function (t) {
+        var k = t.assigneeName || '(未設定)';
+        if (!vol[k]) { vol[k] = 0; seen[k] = {}; }
+        if (t.roomName && !seen[k][t.roomName]) { seen[k][t.roomName] = 1; vol[k] += (msg[t.roomName] || 0); }
+      });
+      return vol;
+    }
+    // 現在のタスクに存在する担当者を、やり取り量の多い順に並べる
+    function presentAssigneesOrdered() {
+      var cnt = {};
+      currentTasks().forEach(function (t) { var k = t.assigneeName || '(未設定)'; cnt[k] = (cnt[k] || 0) + 1; });
+      var vol = assigneeVolumes(currentTasks());
+      return Object.keys(cnt)
+        .sort(function (a, b) { return (vol[b] || 0) - (vol[a] || 0) || cnt[b] - cnt[a] || a.localeCompare(b, 'ja'); })
+        .map(function (n) { return { name: n, count: cnt[n] }; });
+    }
+    function assigneeVisible(name) {
+      if (selectedAssignees === 'all') return true;
+      return Array.isArray(selectedAssignees) && selectedAssignees.indexOf(name) !== -1;
+    }
+    function saveAssignees() { localStorage.setItem(ASSIGNEES_KEY, JSON.stringify(selectedAssignees)); }
+    function toggleAssigneeMenu(e) {
+      if (e) e.stopPropagation();
+      var m = document.getElementById('assigneeMenu');
+      var willOpen = m.classList.contains('hidden');
+      document.getElementById('userMenu').classList.add('hidden');
+      m.classList.toggle('hidden');
+      if (willOpen) renderAssigneeList();
+    }
+    function ensureAssigneeArray() {
+      if (!Array.isArray(selectedAssignees)) {
+        selectedAssignees = presentAssigneesOrdered().map(function (r) { return r.name; });
+      }
+    }
+    function assigneeSelectAll() { selectedAssignees = 'all'; saveAssignees(); renderAssigneeList(); updateAssigneeBtn(); render(); }
+    function assigneeDeselectAll() { selectedAssignees = []; saveAssignees(); renderAssigneeList(); updateAssigneeBtn(); render(); }
+    function toggleAssignee(name, checked) {
+      ensureAssigneeArray();
+      var i = selectedAssignees.indexOf(name);
+      if (checked && i === -1) selectedAssignees.push(name);
+      if (!checked && i !== -1) selectedAssignees.splice(i, 1);
+      saveAssignees(); updateAssigneeBtn(); render();
+    }
+    function renderAssigneeList() {
+      var list = document.getElementById('assigneeList'); if (!list) return;
+      var people = presentAssigneesOrdered();
+      list.innerHTML = '';
+      if (!people.length) { list.innerHTML = '<div class="none">表示できる担当者がいません。</div>'; return; }
+      people.forEach(function (r) {
+        var lb = document.createElement('label');
+        var cb = document.createElement('input'); cb.type = 'checkbox'; cb.checked = assigneeVisible(r.name);
+        cb.onchange = function () { toggleAssignee(r.name, cb.checked); };
+        var nm = document.createElement('span'); nm.textContent = r.name;
+        var cn = document.createElement('span'); cn.className = 'rcount'; cn.textContent = r.count;
+        lb.appendChild(cb); lb.appendChild(nm); lb.appendChild(cn);
+        list.appendChild(lb);
+      });
+    }
+    function updateAssigneeBtn() {
+      var btn = document.getElementById('assigneeBtn'); if (!btn) return;
+      var label;
+      if (selectedAssignees === 'all') label = '全部';
+      else if (!selectedAssignees.length) label = 'なし';
+      else label = selectedAssignees.length + '人';
+      btn.textContent = '担当者：' + label + ' ▾';
+    }
+    function buildAssigneeFilter() { updateAssigneeBtn(); if (!document.getElementById('assigneeMenu').classList.contains('hidden')) renderAssigneeList(); }
+    // ビューに応じてルール/担当者のプルダウンを出し分ける
+    function updateFilterVisibility() {
+      var roomSel = document.getElementById('roomSel'), asgSel = document.getElementById('assigneeSel');
+      if (!roomSel || !asgSel) return;
+      var isAssignee = (view === 'assignee');
+      roomSel.classList.toggle('hidden', isAssignee);
+      asgSel.classList.toggle('hidden', !isAssignee);
+    }
+
     function cleanBody(b) {
       return String(b || '')
         .replace(/\[info\][\s\S]*?\[\/info\]/g, function (m) { return m.replace(/\[\/?[a-zA-Z][^\]]*\]/g, ''); })
@@ -651,7 +748,9 @@
           if (kind === 'task' && t.isMemo) return false;
           if (kind === 'memo' && !t.isMemo) return false;
         }
-        if (!roomVisible(t.roomName)) return false;
+        // 担当者別ビューは担当者フィルタ、それ以外はルームフィルタで絞る
+        if (view === 'assignee') { if (!assigneeVisible(t.assigneeName || '(未設定)')) return false; }
+        else { if (!roomVisible(t.roomName)) return false; }
         if (q) { if ((t.body + ' ' + t.roomName + ' ' + t.assigneeName).toLowerCase().indexOf(q) === -1) return false; }
         return true;
       });
@@ -898,12 +997,13 @@
       var map = {};
       tasks.forEach(function (t) { var k = t.assigneeName || '(未設定)'; (map[k] = map[k] || []).push(t); });
       var pos = {}; assigneeOrder.forEach(function (n, i) { pos[n] = i; });
+      var vol = assigneeVolumes(tasks); // 担当者ごとのやり取り量（ルームのメッセージ数合計）
       var keys = Object.keys(map).sort(function (a, b) {
         var pa = pos[a], pb = pos[b], ha = pa !== undefined, hb = pb !== undefined;
         if (ha && hb) return pa - pb;       // 手動順を優先
         if (ha) return -1;
         if (hb) return 1;
-        return map[b].length - map[a].length; // 残りは件数の多い順
+        return (vol[b] || 0) - (vol[a] || 0) || map[b].length - map[a].length; // 残りはやり取りの多い順→件数順
       });
       var board = document.createElement('div'); board.className = 'board';
       keys.forEach(function (k) {

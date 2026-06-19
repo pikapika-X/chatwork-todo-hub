@@ -169,7 +169,8 @@ async function apiRoomList(token) {
     room_id: r.room_id,
     name: r.name,
     icon_path: r.icon_path || '',
-    last_update_time: r.last_update_time || 0
+    last_update_time: r.last_update_time || 0,
+    message_num: r.message_num || 0
   }));
   console.log('roomList rooms=' + slim.length);
   return { ok: true, me: publicMe(me), rooms: slim };
