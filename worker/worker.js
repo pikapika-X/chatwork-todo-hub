@@ -171,6 +171,7 @@ async function apiRoomList(token) {
     icon_path: r.icon_path || '',
     last_update_time: r.last_update_time || 0,
     message_num: r.message_num || 0,
+    task_num: r.task_num || 0, // そのルームの未完了タスク数（全担当者）。0なら取得をスキップできる
     type: r.type || '' // 'my' | 'direct' | 'group'。direct=1on1チャット
   }));
   console.log('roomList rooms=' + slim.length);
@@ -189,6 +190,8 @@ async function apiRoomTasksBatch(token, rooms, force, ctx) {
     const lut = room.last_update_time || 0;
     // last_update_time をキーに含める → 部屋が更新されるとキーが変わり自動で取り直しになる
     const cacheKey = new Request('https://cw-cache.local/rt/' + dg + '/' + room.room_id + '/' + lut);
+    // lut を含めない「最新版」キー。混雑(429)時に前回の結果を見せるためのフォールバック
+    const latestKey = new Request('https://cw-cache.local/rt-latest/' + dg + '/' + room.room_id);
 
     if (!force) {
       const hit = await cache.match(cacheKey);
@@ -204,7 +207,12 @@ async function apiRoomTasksBatch(token, rooms, force, ctx) {
     const code = res.status;
     if (code === 200) stats.c200++; else if (code === 204) stats.c204++; else if (code === 403) stats.c403++;
     else if (code === 404) stats.c404++; else if (code === 429) stats.c429++; else if (code >= 500) stats.c5xx++; else stats.other++;
-    if (code === 429 || code >= 500) return; // 混雑/一時エラー → スキップ（キャッシュしない）
+    if (code === 429 || code >= 500) {
+      // 混雑/一時エラー → 前回保存した最新版があれば見せる（無ければスキップ）
+      const stale = await cache.match(latestKey);
+      if (stale) { (await stale.json()).forEach(t => tasks.push(t)); }
+      return;
+    }
 
     let shaped = [];
     if (code === 200) {
@@ -225,10 +233,13 @@ async function apiRoomTasksBatch(token, rooms, force, ctx) {
     }
 
     shaped.forEach(t => tasks.push(t));
-    const resp = new Response(JSON.stringify(shaped), {
+    const body = JSON.stringify(shaped);
+    ctx.waitUntil(cache.put(cacheKey, new Response(body, {
       headers: { 'Cache-Control': 'max-age=21600', 'Content-Type': 'application/json' }
-    });
-    ctx.waitUntil(cache.put(cacheKey, resp)); // 6時間保持
+    }))); // lut付き：6時間保持
+    ctx.waitUntil(cache.put(latestKey, new Response(body, {
+      headers: { 'Cache-Control': 'max-age=86400', 'Content-Type': 'application/json' }
+    }))); // 最新版：24時間。混雑時フォールバック用
   });
 
   console.log('roomTasksBatch', JSON.stringify(stats), 'tasks=' + tasks.length);
