@@ -196,7 +196,7 @@
     .kname{flex:1 1 auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
     .kctr{display:flex;gap:3px;flex:0 0 auto;align-items:center}
     .kx{min-height:24px;padding:0 6px;font-size:11px;background:var(--surface);border:1px solid var(--line);color:var(--sub)}
-    .kpos{min-height:24px;padding:0 4px;font-size:11px;background:var(--surface);border:1px solid var(--line);color:var(--sub);border-radius:5px}
+    .kmove{min-height:28px;max-width:120px;padding:0 6px;font-size:12px;background:var(--surface);border:1px solid var(--line);border-radius:6px;color:var(--ink)}
     .hiddenbar{display:flex;align-items:center;flex-wrap:wrap;gap:6px;margin:0 0 10px;font-size:12px}
     .hiddenbar-lb{color:var(--sub);font-weight:700}
     .hiddenchip{min-height:26px;padding:2px 10px;font-size:12px;background:var(--surface);border:1px dashed var(--line2);border-radius:14px;color:var(--ink)}
@@ -483,7 +483,7 @@
       if (document.hidden || !token) return;
       if (!document.getElementById('remModal').classList.contains('hidden')) return; // ダイアログ中は触らない
       if (pushTimer) flushPush();        // 自分の未送信の変更を先に保存
-      var useForce = (++silentCount % 6 === 0); // 6回に1回（≒30分）はフル取得して削除タスクも反映
+      var useForce = (++silentCount % 12 === 0); // 12回に1回（≒1時間）はフル取得して削除タスクも反映
       pullSettings(function () {          // 別端末の設定変更を取り込んでから…
         google.script.run.withSuccessHandler(function (r) {
           if (!r.ok) return;
@@ -982,6 +982,12 @@
 
     /* ---- 自分のタスク：カスタムカンバン ---- */
     function columnExists(id) { var c = activeColumns(); for (var i = 0; i < c.length; i++) if (c[i].id === id) return true; return false; }
+    // タスクを別インデックスへ即移動（ドラッグせずプルダウンで選ぶ＝スマホで素早い）
+    function moveTaskToCol(t, colId) {
+      var asg = activeAssign();
+      if (colId === '_inbox') delete asg[t.taskId]; else asg[t.taskId] = colId;
+      saveAssign(); render();
+    }
 
     function addColumn() {
       var s = activeScope();
@@ -1016,14 +1022,6 @@
       var moved = cols.splice(from, 1)[0];
       if (at < 0) at = 0; if (at > cols.length) at = cols.length;
       cols.splice(at, 0, moved);
-      saveCols(); render();
-    }
-    function moveColumnToPos(id, pos) { // 位置を選んで一気に移動（スマホ対応）。pos は移動先の番目（0始まり）
-      var cols = activeColumns(); var from = colIndex_(cols, id);
-      if (from === -1 || pos === from) return;
-      var moved = cols.splice(from, 1)[0];
-      if (pos < 0) pos = 0; if (pos > cols.length) pos = cols.length;
-      cols.splice(pos, 0, moved);
       saveCols(); render();
     }
     function renameColumn(id) {
@@ -1122,20 +1120,15 @@
         // 隠す
         var hd = document.createElement('button'); hd.className = 'kx'; hd.textContent = '🙈'; hd.title = 'このインデックスを隠す';
         hd.onclick = function (e) { e.stopPropagation(); hideColumn(colId); };
-        // 位置を選んで一気に移動（スマホでも飛び越えて移動できる）
-        var allCols = activeColumns(); var curIdx = colIndex_(allCols, colId);
-        var sel = document.createElement('select'); sel.className = 'kpos'; sel.title = '位置を変更（移動）';
-        allCols.forEach(function (c, i) {
-          var op = document.createElement('option'); op.value = i; op.textContent = (i + 1) + '番目';
-          if (i === curIdx) op.selected = true; sel.appendChild(op);
-        });
-        sel.onmousedown = function (e) { e.stopPropagation(); };
-        sel.onclick = function (e) { e.stopPropagation(); };
-        sel.onchange = function (e) { e.stopPropagation(); moveColumnToPos(colId, parseInt(sel.value, 10)); };
+        // 列の並べ替え（1個ずつ）
+        var lf = document.createElement('button'); lf.className = 'kx'; lf.textContent = '◀'; lf.title = '左へ移動';
+        lf.onclick = function (e) { e.stopPropagation(); moveColumn(colId, -1); };
+        var rg = document.createElement('button'); rg.className = 'kx'; rg.textContent = '▶'; rg.title = '右へ移動';
+        rg.onclick = function (e) { e.stopPropagation(); moveColumn(colId, 1); };
         // 削除
         var x = document.createElement('button'); x.className = 'kx'; x.textContent = '✕'; x.title = 'この列を削除（タスクは未分類へ戻る）';
         x.onclick = function (e) { e.stopPropagation(); removeColumn(colId); };
-        ctr.appendChild(ren); ctr.appendChild(hd); ctr.appendChild(sel); ctr.appendChild(x);
+        ctr.appendChild(ren); ctr.appendChild(hd); ctr.appendChild(lf); ctr.appendChild(rg); ctr.appendChild(x);
         h.appendChild(ctr);
         // ヘッダーをドラッグして並べ替え（PC）
         h.draggable = true; h.title = 'ドラッグで並べ替え';
@@ -1298,6 +1291,21 @@
         openChatwork(url);
       });
       foot.appendChild(link);
+      // 📁 インデックス移動（カンバン表示＝自分のタスク／ブックマークで、列がある時だけ）
+      if ((view === 'mine' || view === 'bookmark') && activeColumns().length) {
+        var mv = document.createElement('select'); mv.className = 'kmove'; mv.title = 'インデックスを移動';
+        var inboxOpt = document.createElement('option'); inboxOpt.value = '_inbox'; inboxOpt.textContent = '📁 未分類';
+        mv.appendChild(inboxOpt);
+        activeColumns().forEach(function (c) {
+          var op = document.createElement('option'); op.value = c.id; op.textContent = '📁 ' + c.name; mv.appendChild(op);
+        });
+        var curM = activeAssign()[t.taskId];
+        mv.value = (curM && columnExists(curM)) ? curM : '_inbox';
+        mv.onmousedown = function (e) { e.stopPropagation(); };
+        mv.onclick = function (e) { e.stopPropagation(); };
+        mv.onchange = function (e) { e.stopPropagation(); moveTaskToCol(t, mv.value); };
+        foot.appendChild(mv);
+      }
       // ⭐ブックマーク（このブラウザに保存）
       var star = document.createElement('button');
       star.className = 'star-btn' + (isBookmarked(t) ? ' on' : '');
