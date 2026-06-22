@@ -194,8 +194,12 @@
     .kcol-h[draggable=true]{cursor:grab}
     .kcol-h[draggable=true]:active{cursor:grabbing}
     .kname{flex:1 1 auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
-    .kctr{display:flex;gap:3px;flex:0 0 auto}
+    .kctr{display:flex;gap:3px;flex:0 0 auto;align-items:center}
     .kx{min-height:24px;padding:0 6px;font-size:11px;background:var(--surface);border:1px solid var(--line);color:var(--sub)}
+    .kpos{min-height:24px;padding:0 4px;font-size:11px;background:var(--surface);border:1px solid var(--line);color:var(--sub);border-radius:5px}
+    .hiddenbar{display:flex;align-items:center;flex-wrap:wrap;gap:6px;margin:0 0 10px;font-size:12px}
+    .hiddenbar-lb{color:var(--sub);font-weight:700}
+    .hiddenchip{min-height:26px;padding:2px 10px;font-size:12px;background:var(--surface);border:1px dashed var(--line2);border-radius:14px;color:var(--ink)}
     .kbody{display:flex;flex-direction:column;gap:8px;min-height:60px}
     .kbody .ph{height:0;border-top:3px solid var(--green);border-radius:2px;margin:1px 0;flex:0 0 auto}
     .kanban .kph{flex:0 0 4px;align-self:stretch;background:var(--green);border-radius:2px;min-height:80px}
@@ -299,6 +303,7 @@
       </div>
       <div class="bar-actions">
         <button class="ghost" onclick="refresh()">更新</button>
+        <button class="ghost" onclick="fullRefresh()" title="キャッシュを無視して全件取り直し。チャットワークで削除したタスクもアプリから消えます">完全更新</button>
       </div>
     </div>
     <div id="userMenu" class="usermenu hidden">
@@ -393,6 +398,7 @@
     var COL_KEYS = { task: 'cwTodoColumnsTask', memo: 'cwTodoColumnsMemo', bm: 'cwTodoColumnsBm' };
     var ASG_KEYS = { task: 'cwTodoAssignTask', memo: 'cwTodoAssignMemo', bm: 'cwTodoAssignBm' };
     var ORD_KEYS = { task: 'cwTodoOrderTask', memo: 'cwTodoOrderMemo', bm: 'cwTodoOrderBm' };
+    var HIDE_KEYS = { task: 'cwTodoHiddenTask', memo: 'cwTodoHiddenMemo', bm: 'cwTodoHiddenBm' };
     var token = '';
     var view = 'mine';
     var cache = { mine: null, room: null };
@@ -401,6 +407,8 @@
     var COLS = { task: [], memo: [], bm: [] }; // 自作インデックス
     var ASG = { task: {}, memo: {}, bm: {} };  // taskId -> colId
     var ORD = { task: {}, memo: {}, bm: {} };  // colId -> [taskId,...] 手動並び順
+    var HIDDEN = { task: [], memo: [], bm: [] }; // 非表示にしたインデックスのcolId
+    var silentCount = 0;                         // 自動更新の回数（時々フル取得して削除を反映するため）
     var NOTE_KEY = 'cwTodoNote';
     var THEME_KEY = 'cwTodoTheme';
     var ASSIGNEE_ORDER_KEY = 'cwTodoAssigneeOrder'; // 旧：手動並び順（廃止。起動時に掃除する）
@@ -475,6 +483,7 @@
       if (document.hidden || !token) return;
       if (!document.getElementById('remModal').classList.contains('hidden')) return; // ダイアログ中は触らない
       if (pushTimer) flushPush();        // 自分の未送信の変更を先に保存
+      var useForce = (++silentCount % 6 === 0); // 6回に1回（≒30分）はフル取得して削除タスクも反映
       pullSettings(function () {          // 別端末の設定変更を取り込んでから…
         google.script.run.withSuccessHandler(function (r) {
           if (!r.ok) return;
@@ -482,7 +491,7 @@
           if (r.me) myId = r.me.accountId;
           if (r.rooms) roomsBrief = r.rooms;
           buildRoomFilter(); buildAssigneeFilter(); render();
-        }).withFailureHandler(function () {}).apiRoomTasks(token, false); // タスクは軽量（変化のあった部屋だけ）
+        }).withFailureHandler(function () {}).apiRoomTasks(token, useForce); // 通常は軽量（変化のあった部屋だけ）／時々フル
       });
     }
 
@@ -498,6 +507,8 @@
     function saveCols() { var s = activeScope(); lsSet(COL_KEYS[s], JSON.stringify(COLS[s])); }
     function saveAssign() { var s = activeScope(); lsSet(ASG_KEYS[s], JSON.stringify(ASG[s])); }
     function saveOrder() { var s = activeScope(); lsSet(ORD_KEYS[s], JSON.stringify(ORD[s])); }
+    function activeHidden() { return HIDDEN[activeScope()]; }
+    function saveHidden() { var s = activeScope(); lsSet(HIDE_KEYS[s], JSON.stringify(HIDDEN[s])); }
     function getBaseline() { var v = localStorage.getItem(BASE_KEY); return v ? Number(v) : null; }
     function setBaseline(v) { localStorage.setItem(BASE_KEY, String(v)); } // 起点は端末ごと（同期しない）
     function saveShowAll() { lsSet(SHOWALL_KEY, document.getElementById('showAll').checked ? '1' : '0'); render(); }
@@ -508,7 +519,8 @@
       THEME_KEY, NOTE_KEY, SHOWALL_KEY, ROOMS_KEY, ASSIGNEES_KEY, REM_KEY, BM_KEY,
       COL_KEYS.task, COL_KEYS.memo, COL_KEYS.bm,
       ASG_KEYS.task, ASG_KEYS.memo, ASG_KEYS.bm,
-      ORD_KEYS.task, ORD_KEYS.memo, ORD_KEYS.bm
+      ORD_KEYS.task, ORD_KEYS.memo, ORD_KEYS.bm,
+      HIDE_KEYS.task, HIDE_KEYS.memo, HIDE_KEYS.bm
     ];
     var syncReady = false; // PULL完了まで PUSH しない（空ローカルでサーバを潰さないため）
     var pushTimer = null;
@@ -614,6 +626,9 @@
       ORD.task = readJson(ORD_KEYS.task, {});
       ORD.memo = readJson(ORD_KEYS.memo, {});
       ORD.bm = readJson(ORD_KEYS.bm, {});
+      HIDDEN.task = readJson(HIDE_KEYS.task, []);
+      HIDDEN.memo = readJson(HIDE_KEYS.memo, []);
+      HIDDEN.bm = readJson(HIDE_KEYS.bm, []);
       reminders = readJson(REM_KEY, []);
       notifyOn = (localStorage.getItem(NOTIFY_KEY) === '1'); // 端末ごとの通知設定
       bookmarks = readJson(BM_KEY, []);
@@ -676,6 +691,7 @@
     }
 
     function refresh() { pullSettings(function () { load(false, true); }); } // 更新ボタン：設定同期＋差分のみ再取得（変化した部屋だけ＝軽い）
+    function fullRefresh() { pullSettings(function () { load(true); }); }     // 完全更新：キャッシュ無視で全件取り直し（チャットワークで削除したタスクも消える）
 
     // force=true: キャッシュを完全に無視して全取得。fetchAnyway=true: cache.room があっても再取得する（ただし force は渡した値＝部屋単位キャッシュは使う）
     function load(force, fetchAnyway) {
@@ -1002,6 +1018,26 @@
       cols.splice(at, 0, moved);
       saveCols(); render();
     }
+    function moveColumnToPos(id, pos) { // 位置を選んで一気に移動（スマホ対応）。pos は移動先の番目（0始まり）
+      var cols = activeColumns(); var from = colIndex_(cols, id);
+      if (from === -1 || pos === from) return;
+      var moved = cols.splice(from, 1)[0];
+      if (pos < 0) pos = 0; if (pos > cols.length) pos = cols.length;
+      cols.splice(pos, 0, moved);
+      saveCols(); render();
+    }
+    function renameColumn(id) {
+      var c = activeColumns().filter(function (x) { return x.id === id; })[0]; if (!c) return;
+      var name = (prompt('インデックス名を変更', c.name) || '').trim();
+      if (!name) return;
+      c.name = name; saveCols(); render();
+    }
+    function hideColumn(id) {
+      var h = activeHidden(); if (h.indexOf(id) === -1) { h.push(id); saveHidden(); render(); }
+    }
+    function unhideColumn(id) {
+      var s = activeScope(); HIDDEN[s] = HIDDEN[s].filter(function (x) { return x !== id; }); saveHidden(); render();
+    }
     var _kph = null;
     function ensureKph() { if (!_kph) { _kph = document.createElement('div'); _kph.className = 'kph'; } return _kph; }
     function removeKph() { if (_kph && _kph.parentNode) _kph.parentNode.removeChild(_kph); }
@@ -1029,15 +1065,30 @@
       return idx;
     }
 
+    function buildHiddenBar(hidCols) {
+      var bar = document.createElement('div'); bar.className = 'hiddenbar';
+      var lb = document.createElement('span'); lb.className = 'hiddenbar-lb'; lb.textContent = '🙈 非表示：';
+      bar.appendChild(lb);
+      hidCols.forEach(function (c) {
+        var b = document.createElement('button'); b.className = 'hiddenchip';
+        b.textContent = c.name + ' ↩'; b.title = 'クリックで再表示';
+        b.onclick = function () { unhideColumn(c.id); };
+        bar.appendChild(b);
+      });
+      return bar;
+    }
     function renderMine(content, tasks) {
-      var cols = activeColumns(), asg = activeAssign();
+      var cols = activeColumns(), asg = activeAssign(), hidden = activeHidden();
       var bm = activeScope() === 'bm';
+      var visCols = cols.filter(function (c) { return hidden.indexOf(c.id) === -1; });
+      var hidCols = cols.filter(function (c) { return hidden.indexOf(c.id) !== -1; });
+      if (hidCols.length) content.appendChild(buildHiddenBar(hidCols));
       var inboxName = bm ? (cols.length ? '未分類' : 'ブックマーク') : '未分類';
       var kanban = document.createElement('div');
-      kanban.className = 'kanban' + ((cols.length + 1) >= 4 ? ' scroll' : '');
+      kanban.className = 'kanban' + ((visCols.length + 1) >= 4 ? ' scroll' : '');
       kanban.appendChild(buildColumn('_inbox', inboxName,
         tasks.filter(function (t) { return !asg[t.taskId] || !columnExists(asg[t.taskId]); }), false));
-      cols.forEach(function (c) {
+      visCols.forEach(function (c) {
         kanban.appendChild(buildColumn(c.id, c.name, tasks.filter(function (t) { return asg[t.taskId] === c.id; }), true));
       });
       // インデックス（列）の並べ替え：ヘッダーをドラッグ（PC）。kanban全体で受ける。
@@ -1065,13 +1116,26 @@
       h.appendChild(nm);
       if (removable) {
         var ctr = document.createElement('span'); ctr.className = 'kctr';
-        var lf = document.createElement('button'); lf.className = 'kx'; lf.textContent = '◀'; lf.title = '左へ移動';
-        lf.onclick = function (e) { e.stopPropagation(); moveColumn(colId, -1); };
-        var rg = document.createElement('button'); rg.className = 'kx'; rg.textContent = '▶'; rg.title = '右へ移動';
-        rg.onclick = function (e) { e.stopPropagation(); moveColumn(colId, 1); };
+        // 名前変更
+        var ren = document.createElement('button'); ren.className = 'kx'; ren.textContent = '✎'; ren.title = '名前を変更';
+        ren.onclick = function (e) { e.stopPropagation(); renameColumn(colId); };
+        // 隠す
+        var hd = document.createElement('button'); hd.className = 'kx'; hd.textContent = '🙈'; hd.title = 'このインデックスを隠す';
+        hd.onclick = function (e) { e.stopPropagation(); hideColumn(colId); };
+        // 位置を選んで一気に移動（スマホでも飛び越えて移動できる）
+        var allCols = activeColumns(); var curIdx = colIndex_(allCols, colId);
+        var sel = document.createElement('select'); sel.className = 'kpos'; sel.title = '位置を変更（移動）';
+        allCols.forEach(function (c, i) {
+          var op = document.createElement('option'); op.value = i; op.textContent = (i + 1) + '番目';
+          if (i === curIdx) op.selected = true; sel.appendChild(op);
+        });
+        sel.onmousedown = function (e) { e.stopPropagation(); };
+        sel.onclick = function (e) { e.stopPropagation(); };
+        sel.onchange = function (e) { e.stopPropagation(); moveColumnToPos(colId, parseInt(sel.value, 10)); };
+        // 削除
         var x = document.createElement('button'); x.className = 'kx'; x.textContent = '✕'; x.title = 'この列を削除（タスクは未分類へ戻る）';
         x.onclick = function (e) { e.stopPropagation(); removeColumn(colId); };
-        ctr.appendChild(lf); ctr.appendChild(rg); ctr.appendChild(x);
+        ctr.appendChild(ren); ctr.appendChild(hd); ctr.appendChild(sel); ctr.appendChild(x);
         h.appendChild(ctr);
         // ヘッダーをドラッグして並べ替え（PC）
         h.draggable = true; h.title = 'ドラッグで並べ替え';
@@ -1223,8 +1287,8 @@
       if (t.isMemo) { var mt = document.createElement('span'); mt.className = 'tag memo'; mt.textContent = 'メモ'; foot.appendChild(mt); }
       if (urls && urls.length) { var it = document.createElement('span'); it.className = 'imgtag'; it.textContent = '🖼'; foot.appendChild(it); }
       var link = document.createElement('a');
-      // 自分のタスクはルーム（未読）へ、それ以外（担当者別・ブックマーク）はそのタスク位置へ。
-      var url = (view === 'mine') ? ('https://www.chatwork.com/#!rid' + t.roomId) : t.link;
+      // 全ビューとも、そのタスクが書かれたチャット位置（メッセージ）へ飛ぶ。link が無い時だけルーム先頭。
+      var url = t.link || ('https://www.chatwork.com/#!rid' + t.roomId);
       link.href = url;
       link.target = 'chatwork';
       link.textContent = '開く';
