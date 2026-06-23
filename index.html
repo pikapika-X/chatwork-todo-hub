@@ -128,6 +128,12 @@
       border-radius:8px;box-shadow:var(--shadow);padding:6px}
     .usermenu button{width:100%;white-space:nowrap}
     .bar-actions{display:flex;gap:8px;flex-wrap:wrap}
+    .refresh-split{position:relative;display:inline-flex}
+    .refresh-split .refresh-main{border-top-right-radius:0;border-bottom-right-radius:0}
+    .refresh-split .refresh-caret{border-top-left-radius:0;border-bottom-left-radius:0;border-left:none;padding:0 8px;font-size:11px}
+    .refresh-menu{position:absolute;right:0;top:calc(100% + 5px);z-index:45;background:var(--surface);
+      border:1px solid var(--line);border-radius:8px;box-shadow:var(--shadow);padding:6px;white-space:nowrap}
+    .refresh-menu button{width:100%;white-space:nowrap}
     .tabs{display:flex;gap:6px;flex-wrap:wrap}
     .tab{min-height:34px;border:1px solid var(--line);border-radius:999px;background:var(--surface);
       color:var(--sub);padding:0 14px;font-weight:700;cursor:pointer}
@@ -311,8 +317,13 @@
         <textarea id="note" class="note" placeholder="📝 進捗メモなど自由に（このブラウザに自動保存）"></textarea>
       </div>
       <div class="bar-actions">
-        <button class="ghost" onclick="refresh()">更新</button>
-        <button class="ghost" onclick="fullRefresh()" title="キャッシュを無視して全件取り直し。チャットワークで削除したタスクもアプリから消えます">完全更新</button>
+        <div class="refresh-split">
+          <button class="ghost refresh-main" onclick="refresh()">更新</button>
+          <button class="ghost refresh-caret" onclick="toggleRefreshMenu(event)" aria-label="更新オプション" title="更新オプション">▾</button>
+          <div id="refreshMenu" class="refresh-menu hidden" onclick="event.stopPropagation()">
+            <button class="ghost" onclick="fullRefresh(); closeRefreshMenu()" title="キャッシュを無視して全件取り直し。チャットワークで削除したタスクもアプリから消えます">🧹 完全キャッシュクリア（削除も反映）</button>
+          </div>
+        </div>
       </div>
     </div>
     <div id="userMenu" class="usermenu hidden">
@@ -474,6 +485,7 @@
         var m = document.getElementById('userMenu'); if (m) m.classList.add('hidden');
         var r = document.getElementById('roomMenu'); if (r) r.classList.add('hidden');
         var a = document.getElementById('assigneeMenu'); if (a) a.classList.add('hidden');
+        var rm = document.getElementById('refreshMenu'); if (rm) rm.classList.add('hidden');
       });
       // 画面に戻ってきたら別端末の変更を取り込む（自分の未送信分は先に保存）
       document.addEventListener('visibilitychange', function () {
@@ -701,6 +713,8 @@
 
     function refresh() { pullSettings(function () { load(false, true); }); } // 更新ボタン：設定同期＋差分のみ再取得（変化した部屋だけ＝軽い）
     function fullRefresh() { pullSettings(function () { load(true); }); }     // 完全更新：キャッシュ無視で全件取り直し（チャットワークで削除したタスクも消える）
+    function toggleRefreshMenu(e) { if (e) e.stopPropagation(); document.getElementById('refreshMenu').classList.toggle('hidden'); }
+    function closeRefreshMenu() { var m = document.getElementById('refreshMenu'); if (m) m.classList.add('hidden'); }
 
     // force=true: キャッシュを完全に無視して全取得。fetchAnyway=true: cache.room があっても再取得する（ただし force は渡した値＝部屋単位キャッシュは使う）
     function load(force, fetchAnyway) {
@@ -1430,6 +1444,7 @@
         reminders.push({
           id: 'r' + Date.now(), taskId: pendingRemTask.taskId, roomId: pendingRemTask.roomId,
           room: pendingRemTask.roomName || '', body: (cleanBody(pendingRemTask.body) || '').slice(0, 120),
+          link: pendingRemTask.link || '', // 通知タップでこのチャットワークのタスク位置へ飛ぶ
           time: when, fired: false, rep: rep, repN: repN
         });
       }
@@ -1515,14 +1530,18 @@
     }
     function fireReminder(r) {
       var title = '⏰ リマインド' + (r.room ? '：' + r.room : '');
+      // 通知タップ時の飛び先＝そのタスクのチャットワーク位置（無ければルーム）
+      var url = r.link || ('https://www.chatwork.com/#!rid' + r.roomId);
       if (!notifyOn) { try { document.title = '⏰ リマインド！'; } catch (_) {} return; } // 通知オフ時は本体に出さない
-      // requireInteraction: ユーザーが操作（OK/タップ）するまで通知を消さない
-      var opts = { body: r.body, icon: 'icon-192.png?v=2', badge: 'icon-192.png?v=2', tag: 'rem-' + r.id, renotify: true, requireInteraction: true };
+      // requireInteraction: ユーザーが操作（OK/タップ）するまで通知を消さない。data.url はSWがタップ時に開く
+      var opts = { body: r.body, icon: 'icon-192.png?v=2', badge: 'icon-192.png?v=2', tag: 'rem-' + r.id, renotify: true, requireInteraction: true, data: { url: url } };
       var shown = false;
       try {
         if ('Notification' in window && Notification.permission === 'granted') {
           if (swReg && swReg.showNotification) { swReg.showNotification(title, opts); shown = true; } // スマホ対応はこちら
-          else if (typeof Notification === 'function') { try { new Notification(title, opts); shown = true; } catch (_) {} }
+          else if (typeof Notification === 'function') {
+            try { var n = new Notification(title, opts); n.onclick = function () { try { window.focus(); } catch (_) {} openChatwork(url); n.close(); }; shown = true; } catch (_) {}
+          }
         }
       } catch (_) {}
       if (!shown) { try { document.title = '⏰ リマインド！'; } catch (_) {} alert(title + '\n' + r.body); }
