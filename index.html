@@ -166,7 +166,8 @@
 
     /* card */
     .card{border:1px solid var(--line);border-left:4px solid var(--line2);border-radius:8px;
-      background:var(--surface);padding:9px 10px;cursor:grab}
+      background:var(--surface);padding:9px 10px;cursor:grab;
+      -webkit-user-select:none;user-select:none;-webkit-touch-callout:none} /* 長押しドラッグ時の選択/メニューを抑止 */
     .card.memo{border-left-color:var(--blue)}
     .card.bookmark{border-left-color:var(--gold)}
     .tag.bm{background:var(--gold-s);color:var(--gold);font-weight:700}
@@ -224,6 +225,9 @@
       .kanban .kcol,.kanban.scroll .kcol{flex:0 0 82vw;max-width:340px}
     }
     .card.dragging{opacity:.4}
+    /* スマホのタッチドラッグで指に追従する複製。pointer-events:none で elementFromPoint の邪魔をしない */
+    .drag-ghost{position:fixed;left:0;top:0;z-index:70;pointer-events:none;opacity:.95;margin:0;
+      box-shadow:var(--shadow);transform:rotate(1.5deg)}
 
     /* assignee board (compact) */
     .board{display:flex;gap:10px;overflow-x:auto;padding-bottom:10px;align-items:flex-start}
@@ -284,7 +288,6 @@
     :root[data-theme="dark"] .token-logo{
       box-sizing:content-box;background:#eef1f6;padding:3px 9px;border-radius:7px;
       box-shadow:0 0 0 1px rgba(255,255,255,.12)}
-    @media(max-width:760px){.filters{grid-template-columns:1fr 1fr}}
   </style>
 </head>
 <body>
@@ -421,7 +424,7 @@
     var HIDE_KEYS = { task: 'cwTodoHiddenTask', memo: 'cwTodoHiddenMemo', bm: 'cwTodoHiddenBm' };
     var token = '';
     var view = 'mine';
-    var cache = { mine: null, room: null };
+    var cache = { room: null };
     var roomsBrief = [];
     var me = null;
     var COLS = { task: [], memo: [], bm: [] }; // 自作インデックス
@@ -445,6 +448,7 @@
     var BM_KEY = 'cwTodoBookmarks';
     var bookmarks = [];
     var draggingTask = null;
+    var touchDrag = null;        // スマホのタッチドラッグ中の状態（{task,card,ghost,targetBody,targetCol}）
     var pendingRemTask = null;
     var editingRemId = null; // リマインド編集中のID（新規時はnull）
 
@@ -508,9 +512,11 @@
       pullSettings(function () {          // 別端末の設定変更を取り込んでから…
         google.script.run.withSuccessHandler(function (r) {
           if (!r.ok) return;
+          congested = false;            // 自動更新で取得に成功したら「混雑中」表示を解除
           cache.room = r.tasks;
           if (r.me) myId = r.me.accountId;
           if (r.rooms) roomsBrief = r.rooms;
+          try { localStorage.setItem(LASTGOOD_KEY, JSON.stringify({ at: Date.now(), tasks: r.tasks, me: r.me, rooms: r.rooms })); } catch (e) {} // 混雑時フォールバック用の前回データも更新
           buildRoomFilter(); buildAssigneeFilter(); render();
         }).withFailureHandler(function () {}).apiRoomTasks(token, useForce); // 通常は軽量（変化のあった部屋だけ）／時々フル
       });
@@ -692,7 +698,7 @@
 
     function changeToken() {
       localStorage.removeItem(TOKEN_KEY);
-      token = ''; me = null; cache = { mine: null, room: null };
+      token = ''; me = null; cache = { room: null };
       document.getElementById('appView').classList.add('hidden');
       document.getElementById('tokenView').classList.remove('hidden');
       document.getElementById('remZone').classList.add('hidden');
@@ -1131,7 +1137,8 @@
 
     function buildColumn(colId, name, list, removable) {
       var col = document.createElement('div'); col.className = 'kcol';
-      if (removable) col.dataset.colid = colId;
+      col.dataset.col = colId;                    // タッチ移動の対象列特定用（inbox含む全列）
+      if (removable) col.dataset.colid = colId;   // 列の並べ替え対象はカスタム列のみ（inboxは除外）
       var h = document.createElement('div'); h.className = 'kcol-h';
       var nm = document.createElement('span'); nm.className = 'kname'; nm.textContent = name + ' (' + list.length + ')';
       h.appendChild(nm);
@@ -1164,7 +1171,6 @@
       col.appendChild(h);
       var body = document.createElement('div'); body.className = 'kbody';
       // 全列で並べ替え・配置変更が可能。オリジナル選択時のみ手動順を表示（他は選択中のソート順）。
-      var sortable = true;
       var useManual = document.getElementById('sort').value === 'original';
       var ordered = useManual ? orderedList(colId, list) : list;
       ordered.forEach(function (t) { body.appendChild(taskCard(t)); });
@@ -1175,7 +1181,7 @@
         e.preventDefault();
         try { e.dataTransfer.dropEffect = 'move'; } catch (_) {}
         col.classList.add('over');
-        if (sortable) positionPlaceholder(body, e.clientY); // 挿入位置の線
+        positionPlaceholder(body, e.clientY); // 挿入位置の線
       });
       col.addEventListener('dragleave', function (e) {
         if (e.target === col || !col.contains(e.relatedTarget)) { col.classList.remove('over'); removePlaceholder(); }
@@ -1187,7 +1193,6 @@
         if (!id) { removePlaceholder(); return; }
         var asg = activeAssign();
         if (colId === '_inbox') delete asg[id]; else asg[id] = colId;
-        if (!sortable) { removePlaceholder(); saveAssign(); render(); return; }
         // 並び順を確定
         var at = placeholderIndex(body); removePlaceholder();
         var ids = colCardIds(body).filter(function (x) { return x !== id; });
@@ -1243,6 +1248,82 @@
       return idx;
     }
 
+    /* ---- スマホ：タッチでカードをドラッグ＆並べ替え（HTML5 DnD はタッチ非対応のため独自実装） ----
+       使い方：カードを少し長押し（250ms）すると「つかむ」。指の真下の列に挿入位置の線を出し、
+       離した場所へ移動＋並び順を保存する。PCの従来ドラッグ（dragstart/drop）はそのまま併存。
+       ※同じ列内の手動並べ替えは「並び順＝オリジナル」のとき表示に反映される（初期値はオリジナル）。 */
+    function attachCardTouch(card, t) {
+      var lpTimer = null, started = false, sx = 0, sy = 0;
+      card.addEventListener('touchstart', function (e) {
+        if (view === 'assignee') return;                  // 担当者別は並べ替え対象外
+        if (e.touches.length !== 1) return;               // マルチタッチ（ピンチ等）は無視
+        if (e.target.closest('button,select,a')) return;  // ボタン/プルダウン/リンクの操作を邪魔しない
+        var p = e.touches[0]; sx = p.clientX; sy = p.clientY; started = false;
+        lpTimer = setTimeout(function () { started = true; beginTouchDrag(card, t, sx, sy); }, 250);
+      }, { passive: true });
+      card.addEventListener('touchmove', function (e) {
+        if (!started) {
+          var p = e.touches[0];
+          // 長押し成立前に大きく動いたら「スクロール」と判断してドラッグ開始を取り消す
+          if (lpTimer && (Math.abs(p.clientX - sx) > 10 || Math.abs(p.clientY - sy) > 10)) { clearTimeout(lpTimer); lpTimer = null; }
+          return;                  // 成立前はスクロールを通す（preventDefault しない）
+        }
+        e.preventDefault();        // つかんでいる間はスクロールを止める
+        moveTouchDrag(e.touches[0]);
+      }, { passive: false });
+      card.addEventListener('touchend', function () { if (lpTimer) { clearTimeout(lpTimer); lpTimer = null; } if (started) { started = false; endTouchDrag(); } });
+      card.addEventListener('touchcancel', function () { if (lpTimer) { clearTimeout(lpTimer); lpTimer = null; } if (started) { started = false; cancelTouchDrag(); } });
+    }
+    function positionGhost(x, y) {
+      var g = touchDrag && touchDrag.ghost; if (!g) return;
+      g.style.left = (x - g._dx) + 'px'; g.style.top = (y - g._dy) + 'px';
+    }
+    function beginTouchDrag(card, t, x, y) {
+      draggingTask = t;
+      try { if (navigator.vibrate) navigator.vibrate(15); } catch (_) {} // つかんだ合図（対応端末のみ）
+      var rect = card.getBoundingClientRect();
+      var ghost = card.cloneNode(true);
+      ghost.className = 'card drag-ghost'; ghost.style.width = rect.width + 'px';
+      ghost._dx = x - rect.left; ghost._dy = y - rect.top;
+      document.body.appendChild(ghost);
+      touchDrag = { task: t, card: card, ghost: ghost, targetBody: null, targetCol: null };
+      card.classList.add('dragging');
+      positionGhost(x, y);
+    }
+    function moveTouchDrag(p) {
+      positionGhost(p.clientX, p.clientY);
+      var el = document.elementFromPoint(p.clientX, p.clientY);
+      var col = el && el.closest ? el.closest('.kcol') : null;
+      if (!col) return;                                   // 列の外にいる間は直前の対象を保持
+      var body = col.querySelector('.kbody'); if (!body) return;
+      touchDrag.targetCol = col; touchDrag.targetBody = body;
+      positionPlaceholder(body, p.clientY);               // 挿入位置の線（PCドラッグと共通）
+    }
+    function endTouchDrag() {
+      var td = touchDrag; touchDrag = null;
+      if (td && td.ghost && td.ghost.parentNode) td.ghost.parentNode.removeChild(td.ghost);
+      if (td && td.card) td.card.classList.remove('dragging');
+      var body = td && td.targetBody, col = td && td.targetCol, id = td && String(td.task.taskId);
+      if (body && col && id) {
+        var colId = col.dataset.col || '_inbox';
+        var asg = activeAssign();
+        if (colId === '_inbox') delete asg[id]; else asg[id] = colId;  // どの列に入れるか
+        var at = placeholderIndex(body); removePlaceholder();          // 何番目に入れるか（PCドロップと同じ手順）
+        var ids = colCardIds(body).filter(function (x) { return x !== id; });
+        if (at < 0 || at > ids.length) at = ids.length;
+        ids.splice(at, 0, id);
+        activeOrder()[colId] = ids;
+        saveAssign(); saveOrder(); render();
+      } else { removePlaceholder(); }
+      draggingTask = null;
+    }
+    function cancelTouchDrag() {
+      var td = touchDrag; touchDrag = null;
+      if (td && td.ghost && td.ghost.parentNode) td.ghost.parentNode.removeChild(td.ghost);
+      if (td && td.card) td.card.classList.remove('dragging');
+      removePlaceholder(); draggingTask = null;
+    }
+
     /* ---- 担当者別：コンパクトボード（1on1チャットの会話量が多い順・常に自動） ---- */
     function renderBoard(content, tasks) {
       var map = {};
@@ -1295,6 +1376,7 @@
       });
       card.addEventListener('dragend', function () { card.classList.remove('dragging'); removePlaceholder(); draggingTask = null; });
       attachImgHover(card, urls);
+      attachCardTouch(card, t); // スマホ：長押しでドラッグして移動・並べ替え
       return card;
     }
 
@@ -1334,6 +1416,11 @@
         wrap.appendChild(mv);
         foot.appendChild(wrap);
       }
+      // ⏰ リマインド：スマホはカードをドラッグできないので、タップでも設定できるようにする（PCのドラッグも従来どおり有効）
+      var rem = document.createElement('button'); rem.className = 'cardbtn'; rem.textContent = '⏰';
+      rem.title = 'リマインドを設定';
+      rem.onclick = function (e) { e.stopPropagation(); openRemDialog(t); };
+      foot.appendChild(rem);
       // ⭐ブックマーク（このブラウザに保存）
       var star = document.createElement('button');
       star.className = 'star-btn' + (isBookmarked(t) ? ' on' : '');
@@ -1377,10 +1464,8 @@
     }
 
     function removeTaskFromCache(t) {
-      ['mine', 'room'].forEach(function (k) {
-        if (!cache[k]) return;
-        cache[k] = cache[k].filter(function (x) { return !(String(x.taskId) === String(t.taskId) && String(x.roomId) === String(t.roomId)); });
-      });
+      if (!cache.room) return;
+      cache.room = cache.room.filter(function (x) { return !(String(x.taskId) === String(t.taskId) && String(x.roomId) === String(t.roomId)); });
     }
 
     function showLoading(on) {

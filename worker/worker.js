@@ -97,7 +97,6 @@ async function getRooms(token) {
 }
 
 function publicMe(me) { return { accountId: me.account_id, name: me.name, chatworkId: me.chatwork_id || '' }; }
-function roomsBrief(rooms) { return rooms.map(r => ({ name: r.name, lastUpdate: r.last_update_time || 0 })); }
 
 function stripBodyPrefix(body) {
   return String(body).replace(/^(?:\s|　|\[\/?[a-zA-Z][^\]]*\])+/, '');
@@ -259,7 +258,9 @@ async function apiCompleteTask(token, roomId, taskId) {
     let txt = ''; try { txt = await res.text(); } catch (e) {}
     throw new Error('状態変更に失敗 (' + res.status + '): ' + txt);
   }
-  // その部屋の last_update_time が変わるので、次回 roomTasks で自動的に取り直される。
+  // タスク完了は last_update_time を変えない（メッセージ投稿ではないため）。
+  // そのままだと差分更新で完了済みが復活するので、クライアントが完了後に
+  // apiRefetchRoom（force:true）でその部屋のキャッシュを取り直す。
   return { ok: true };
 }
 
