@@ -10,25 +10,25 @@ self.addEventListener('activate', function (e) {
   e.waitUntil(self.clients.claim());
 });
 
-// 通知をタップしたら、そのタスクのチャットワーク位置（data.url）を開く。無ければアプリを前面に。
+// 通知をタップしたら、このTODOアプリを前面に出して該当タスク（data.roomId/taskId）へ移動する。
+// すでにアプリが開いていればそのウィンドウへ指示を送り、閉じていれば ?focus= 付きで起動する。
 self.addEventListener('notificationclick', function (e) {
   e.notification.close();
-  var url = (e.notification.data && e.notification.data.url) || '';
+  var d = e.notification.data || {};
+  var scope = self.registration.scope; // 例: https://pikapika-x.github.io/chatwork-todo-hub/
   e.waitUntil(
     self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then(function (cls) {
-      if (url) {
-        // すでに開いているチャットワークのタブがあれば、それを使い回して移動
-        for (var i = 0; i < cls.length; i++) {
-          if (cls[i].url && cls[i].url.indexOf('chatwork.com') > -1) {
-            if (cls[i].navigate) { try { cls[i].navigate(url); } catch (_) {} }
-            return cls[i].focus();
-          }
+      // すでに開いている TODO アプリのウィンドウがあれば、前面に出して該当タスクへ移動指示
+      for (var i = 0; i < cls.length; i++) {
+        if (cls[i].url && cls[i].url.indexOf(scope) === 0) {
+          if (cls[i].postMessage) { try { cls[i].postMessage({ type: 'focusTask', roomId: d.roomId, taskId: d.taskId }); } catch (_) {} }
+          return cls[i].focus();
         }
-        if (self.clients.openWindow) return self.clients.openWindow(url);
-        return;
       }
-      for (var j = 0; j < cls.length; j++) { if ('focus' in cls[j]) return cls[j].focus(); }
-      if (self.clients.openWindow) return self.clients.openWindow('./index.html');
+      // 無ければ起動（?focus= で起動後に該当タスクへ移動）
+      var url = './index.html';
+      if (d.roomId && d.taskId) url += '?focus=' + d.roomId + '-' + d.taskId;
+      if (self.clients.openWindow) return self.clients.openWindow(url);
     })
   );
 });

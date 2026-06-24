@@ -228,6 +228,9 @@
     /* スマホのタッチドラッグで指に追従する複製。pointer-events:none で elementFromPoint の邪魔をしない */
     .drag-ghost{position:fixed;left:0;top:0;z-index:70;pointer-events:none;opacity:.95;margin:0;
       box-shadow:var(--shadow);transform:rotate(1.5deg)}
+    /* 通知タップで移動してきたタスクを一瞬光らせて見つけやすくする */
+    .card.focus-flash{animation:focusflash 1.3s ease-in-out 2}
+    @keyframes focusflash{0%,100%{box-shadow:0 0 0 0 rgba(0,0,0,0)}50%{box-shadow:0 0 0 3px var(--green)}}
 
     /* assignee board (compact) */
     .board{display:flex;gap:10px;overflow-x:auto;padding-bottom:10px;align-items:flex-start}
@@ -449,6 +452,7 @@
     var bookmarks = [];
     var draggingTask = null;
     var touchDrag = null;        // スマホのタッチドラッグ中の状態（{task,card,ghost,targetBody,targetCol}）
+    var pendingFocus = null;     // 通知タップで移動したいタスク {roomId,taskId}（データ取得後に実行）
     var pendingRemTask = null;
     var editingRemId = null; // リマインド編集中のID（新規時はnull）
 
@@ -498,6 +502,11 @@
         pullSettings(function () { if (cache.room) { buildRoomFilter(); buildAssigneeFilter(); render(); } });
       });
       window.addEventListener('beforeunload', function () { if (pushTimer) flushPush(); }); // 離脱前に未送信分を保存
+      // 通知から起動した場合、対象タスクを覚えておく（?focus=roomId-taskId）。データ取得後に該当カードへ移動する。
+      try {
+        var mf = location.search.match(/[?&]focus=(\d+)-(\d+)/);
+        if (mf) { pendingFocus = { roomId: mf[1], taskId: mf[2] }; if (history.replaceState) history.replaceState({}, '', location.pathname); }
+      } catch (_) {}
       token = localStorage.getItem(TOKEN_KEY) || '';
       if (token) connect();
     });
@@ -741,10 +750,51 @@
           setBaseline(maxId);
         }
         afterData();
+        if (pendingFocus) applyFocus(); // 通知から起動した場合は該当タスクへ移動
       }).withFailureHandler(failLoad).apiRoomTasks(token, !!force);
     }
 
     function afterData() { buildRoomFilter(); buildAssigneeFilter(); updateFilterVisibility(); render(); }
+
+    /* ---- 通知タップ → このアプリ内の該当タスクカードへ移動してハイライト ---- */
+    function focusTask(roomId, taskId) {
+      pendingFocus = { roomId: String(roomId), taskId: String(taskId) };
+      if (cache.room) applyFocus(); // データがあれば即実行。無ければ load 成功後に実行される
+    }
+    function applyFocus() {
+      if (!pendingFocus || !cache.room) return;
+      var f = pendingFocus;
+      var t = cache.room.filter(function (x) { return String(x.taskId) === f.taskId && String(x.roomId) === f.roomId; })[0];
+      if (!t) { pendingFocus = null; return; } // 完了済みなどで見つからない場合は何もしない
+      // 該当タスクが映るビュー・種別へ切替（保存はしない＝端末間同期に影響させない）
+      view = (String(t.assigneeId) === String(myId)) ? 'mine' : 'assignee';
+      var tabs = document.querySelectorAll('.tab');
+      for (var i = 0; i < tabs.length; i++) tabs[i].classList.toggle('active', tabs[i].dataset.view === view);
+      document.getElementById('addColBtn').classList.toggle('hidden', !(view === 'mine' || view === 'bookmark'));
+      updateFilterVisibility();
+      document.getElementById('kind').value = t.isMemo ? 'memo' : 'task';
+      document.getElementById('showAll').checked = true; // 古いタスクでも隠れないように（保存しない）
+      render();
+      if (!scrollToCard(f.taskId)) {
+        // ルーム/担当者フィルタで隠れている場合は、一時的に全表示にして再描画（保存しないので同期は不変）
+        if (view === 'assignee') selectedAssignees = 'all'; else selectedRooms = 'all';
+        updateRoomBtn(); updateAssigneeBtn(); render();
+        scrollToCard(f.taskId);
+      }
+      pendingFocus = null;
+    }
+    function scrollToCard(taskId) {
+      var cards = document.getElementById('content').querySelectorAll('.card');
+      for (var i = 0; i < cards.length; i++) {
+        if (cards[i].dataset.tid === String(taskId)) {
+          try { cards[i].scrollIntoView({ behavior: 'smooth', block: 'center', inline: 'center' }); } catch (_) { cards[i].scrollIntoView(); }
+          var c = cards[i]; c.classList.add('focus-flash');
+          setTimeout(function () { c.classList.remove('focus-flash'); }, 2600);
+          return true;
+        }
+      }
+      return false;
+    }
 
     // 取得失敗（429など）→ 直近の成功データがあればそれを表示して「混雑中」を出す（真っ白＋0件にしない）
     function failLoad(e) {
@@ -1547,6 +1597,10 @@
       try {
         navigator.serviceWorker.register('sw.js').catch(function (_) {});
         navigator.serviceWorker.ready.then(function (reg) { swReg = reg; }).catch(function (_) {});
+        // 通知タップ（SW）からの「このタスクへ移動」指示を受け取る（アプリが既に開いている場合）
+        navigator.serviceWorker.addEventListener('message', function (e) {
+          var d = e.data || {}; if (d.type === 'focusTask') focusTask(d.roomId, d.taskId);
+        });
       } catch (_) {}
     }
     // 通知許可をユーザー操作の中から要求（コールバック/Promise 両対応・二重呼び防止）
@@ -1617,17 +1671,16 @@
     }
     function fireReminder(r) {
       var title = '⏰ リマインド' + (r.room ? '：' + r.room : '');
-      // 通知タップ時の飛び先＝そのタスクのチャットワーク位置（無ければルーム）
-      var url = r.link || ('https://www.chatwork.com/#!rid' + r.roomId);
       if (!notifyOn) { try { document.title = '⏰ リマインド！'; } catch (_) {} return; } // 通知オフ時は本体に出さない
-      // requireInteraction: ユーザーが操作（OK/タップ）するまで通知を消さない。data.url はSWがタップ時に開く
-      var opts = { body: r.body, icon: 'icon-192.png?v=2', badge: 'icon-192.png?v=2', tag: 'rem-' + r.id, renotify: true, requireInteraction: true, data: { url: url } };
+      // requireInteraction: ユーザーが操作（OK/タップ）するまで通知を消さない。
+      // data に roomId/taskId を持たせ、タップ時はこのTODOアプリの該当タスクへ移動する（SW / onclick が処理）。
+      var opts = { body: r.body, icon: 'icon-192.png?v=2', badge: 'icon-192.png?v=2', tag: 'rem-' + r.id, renotify: true, requireInteraction: true, data: { roomId: r.roomId, taskId: r.taskId } };
       var shown = false;
       try {
         if ('Notification' in window && Notification.permission === 'granted') {
           if (swReg && swReg.showNotification) { swReg.showNotification(title, opts); shown = true; } // スマホ対応はこちら
           else if (typeof Notification === 'function') {
-            try { var n = new Notification(title, opts); n.onclick = function () { try { window.focus(); } catch (_) {} openChatwork(url); n.close(); }; shown = true; } catch (_) {}
+            try { var n = new Notification(title, opts); n.onclick = function () { try { window.focus(); } catch (_) {} focusTask(r.roomId, r.taskId); n.close(); }; shown = true; } catch (_) {}
           }
         }
       } catch (_) {}
