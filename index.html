@@ -1350,13 +1350,15 @@
       return foot;
     }
 
-    // Chatwork用タブを1枚使い回す。すでに開いていても新URL（タスク位置）へ確実に移動させる。
+    // Chatwork用タブを1枚使い回す。'chatwork' という固定名で開くので、既に開いていればそのタブで移動する。
+    // 以前は戻り値が null（COOP等）のとき _blank（無名＝毎回新規）で開いてウィンドウが乱立していたため、フォールバックも同名に統一。
     function openChatwork(url) {
       try {
-        var w = window.open(url, 'chatwork');
-        if (w) { try { w.location.href = url; } catch (_) {} try { w.focus(); } catch (_) {} }
-        else window.open(url, '_blank');
-      } catch (_) { window.open(url, '_blank'); }
+        var w = window.open(url, 'chatwork'); // 同名タブがあれば再利用、無ければ新規
+        if (w) { try { w.focus(); } catch (_) {} }
+      } catch (_) {
+        try { window.open(url, 'chatwork'); } catch (e) {}
+      }
     }
 
     function completeTask(t, btn) {
