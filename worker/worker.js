@@ -45,12 +45,20 @@ export default {
         case 'completeTask':   return jsonResponse(await apiCompleteTask(body.token, body.roomId, body.taskId));
         case 'loadSettings': return jsonResponse(await apiLoadSettings(env, body.token));
         case 'saveSettings': return jsonResponse(await apiSaveSettings(env, body.token, body.payload, body.clientUpdatedAt));
+        case 'savePushSub':  return jsonResponse(await apiSavePushSub(env, body.token, body.deviceId, body.sub));
+        case 'removePushSub':return jsonResponse(await apiRemovePushSub(env, body.token, body.deviceId));
+        case 'saveSchedule': return jsonResponse(await apiSaveSchedule(env, body.token, body.items));
+        case 'getSchedule':  return jsonResponse(await apiGetSchedule(env, body.token));
+        case 'ackReminder':  return jsonResponse(await apiAckReminder(env, body.token, body.id, ctx));
+        case 'pushTest':     return jsonResponse(await apiPushTest(env, body.token, ctx));
         default:             return jsonResponse({ ok: false, message: 'unknown action' }, 400);
       }
     } catch (e) {
       return jsonResponse({ ok: false, message: String(e && e.message ? e.message : e) });
     }
-  }
+  },
+  // Cron（毎分）: 期限の来たリマインドを各端末へWebPush送信する
+  async scheduled(event, env, ctx) { ctx.waitUntil(runDueReminders(env)); }
 };
 
 /* ---------- Chatwork helpers ---------- */
@@ -279,4 +287,156 @@ async function apiSaveSettings(env, token, payload, clientUpdatedAt) {
   const updatedAt = Math.max(Date.now(), (clientUpdatedAt || 0) + 1); // 単調増加（後勝ち）
   await env.SETTINGS.put('s_' + dg, JSON.stringify({ v: 1, updatedAt: updatedAt, payload: payload || '' }));
   return { ok: true, updatedAt: updatedAt };
+}
+
+/* ====== Web Push（アプリを閉じていても通知。RFC 8291/8188 + VAPID をWebCryptoで自前実装） ======
+   ・KV: push_<dg> = { deviceId: {endpoint, keys:{p256dh,auth}}, ... }（端末の購読）
+   ・KV: sched_<dg> = { items:[{id,time,rep,repN,e}], updatedAt }（送信スケジュール。e はクライアント暗号文＝サーバは中身を読めない）
+   ・通知本文(e)は端末でAES-GCM暗号化済み。サーバは時刻判定と中継のみ。SWが復号して表示する。 */
+const TENC = new TextEncoder();
+function pB64u(bytes) { let s = ''; const b = new Uint8Array(bytes); for (let i = 0; i < b.length; i++) s += String.fromCharCode(b[i]); return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, ''); }
+function pUb64(u) { const s = atob(String(u).replace(/-/g, '+').replace(/_/g, '/')); const o = new Uint8Array(s.length); for (let i = 0; i < s.length; i++) o[i] = s.charCodeAt(i); return o; }
+function pConcat() { let n = 0; for (let i = 0; i < arguments.length; i++) n += arguments[i].length; const o = new Uint8Array(n); let p = 0; for (let i = 0; i < arguments.length; i++) { o.set(arguments[i], p); p += arguments[i].length; } return o; }
+async function pHkdf(salt, ikm, info, len) {
+  const k = await crypto.subtle.importKey('raw', ikm, 'HKDF', false, ['deriveBits']);
+  return new Uint8Array(await crypto.subtle.deriveBits({ name: 'HKDF', hash: 'SHA-256', salt: salt, info: info }, k, len * 8));
+}
+async function pImportEcdhPub(p256dhB64) {
+  const pub = pUb64(p256dhB64);
+  return crypto.subtle.importKey('jwk', { kty: 'EC', crv: 'P-256', x: pB64u(pub.slice(1, 33)), y: pB64u(pub.slice(33, 65)), ext: true, key_ops: [] }, { name: 'ECDH', namedCurve: 'P-256' }, false, []);
+}
+// 送信ペイロードを aes128gcm で暗号化（RFC 8291）
+async function encryptPush(plaintextBytes, p256dhB64, authB64) {
+  const uaPub = pUb64(p256dhB64), auth = pUb64(authB64);
+  const kp = await crypto.subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveBits']);
+  const asPub = new Uint8Array(await crypto.subtle.exportKey('raw', kp.publicKey));
+  const uaKey = await pImportEcdhPub(p256dhB64);
+  const ecdh = new Uint8Array(await crypto.subtle.deriveBits({ name: 'ECDH', public: uaKey }, kp.privateKey, 256));
+  const ikm = await pHkdf(auth, ecdh, pConcat(TENC.encode('WebPush: info\0'), uaPub, asPub), 32);
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const cek = await pHkdf(salt, ikm, TENC.encode('Content-Encoding: aes128gcm\0'), 16);
+  const nonce = await pHkdf(salt, ikm, TENC.encode('Content-Encoding: nonce\0'), 12);
+  const aesKey = await crypto.subtle.importKey('raw', cek, { name: 'AES-GCM' }, false, ['encrypt']);
+  const record = pConcat(plaintextBytes, new Uint8Array([0x02]));
+  const ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv: nonce }, aesKey, record));
+  const rs = new Uint8Array([0, 0, 0x10, 0x00]); // record size 4096
+  return pConcat(salt, rs, new Uint8Array([asPub.length]), asPub, ct);
+}
+// VAPID の Authorization ヘッダ（ES256 JWT）
+async function vapidAuth(endpoint, env) {
+  const aud = new URL(endpoint).origin;
+  const pub = pUb64(env.VAPID_PUBLIC);
+  const key = await crypto.subtle.importKey('jwk', { kty: 'EC', crv: 'P-256', d: env.VAPID_PRIVATE, x: pB64u(pub.slice(1, 33)), y: pB64u(pub.slice(33, 65)), ext: true, key_ops: ['sign'] }, { name: 'ECDSA', namedCurve: 'P-256' }, false, ['sign']);
+  const header = pB64u(TENC.encode(JSON.stringify({ typ: 'JWT', alg: 'ES256' })));
+  const payload = pB64u(TENC.encode(JSON.stringify({ aud: aud, exp: Math.floor(Date.now() / 1000) + 12 * 3600, sub: env.VAPID_SUBJECT || 'https://example.com' })));
+  const data = header + '.' + payload;
+  const sig = new Uint8Array(await crypto.subtle.sign({ name: 'ECDSA', hash: 'SHA-256' }, key, TENC.encode(data)));
+  return 'vapid t=' + data + '.' + pB64u(sig) + ', k=' + env.VAPID_PUBLIC;
+}
+// 1端末へ送信。戻りは HTTP ステータス（404/410 は購読切れ＝呼び出し側で掃除）
+async function sendWebPush(sub, payloadObj, env) {
+  const body = await encryptPush(TENC.encode(JSON.stringify(payloadObj)), sub.keys.p256dh, sub.keys.auth);
+  const res = await fetch(sub.endpoint, {
+    method: 'POST',
+    headers: { 'Authorization': await vapidAuth(sub.endpoint, env), 'Content-Encoding': 'aes128gcm', 'Content-Type': 'application/octet-stream', 'TTL': '2419200' },
+    body: body
+  });
+  return res.status;
+}
+
+function advanceTime(time, rep, n) {
+  n = n || 1;
+  if (rep === 'hour') return time + n * 3600000;
+  if (rep === 'day') return time + n * 86400000;
+  if (rep === 'week') return time + 7 * 86400000;
+  if (rep === 'month') { const d = new Date(time); d.setUTCMonth(d.getUTCMonth() + 1); return d.getTime(); }
+  return time;
+}
+
+async function loadSubs(env, dg) { const r = await env.SETTINGS.get('push_' + dg); if (!r) return {}; try { return JSON.parse(r) || {}; } catch (e) { return {}; } }
+async function subList(env, dg) { const m = await loadSubs(env, dg); return Object.keys(m).map(function (d) { return m[d]; }); }
+
+async function apiSavePushSub(env, token, deviceId, sub) {
+  const dg = await tokenDigest(token);
+  if (!deviceId || !sub || !sub.endpoint) return { ok: false, message: 'invalid subscription' };
+  const m = await loadSubs(env, dg);
+  m[deviceId] = { endpoint: sub.endpoint, keys: sub.keys };
+  await env.SETTINGS.put('push_' + dg, JSON.stringify(m));
+  return { ok: true };
+}
+async function apiRemovePushSub(env, token, deviceId) {
+  const dg = await tokenDigest(token);
+  const m = await loadSubs(env, dg);
+  if (deviceId && m[deviceId]) { delete m[deviceId]; await env.SETTINGS.put('push_' + dg, JSON.stringify(m)); }
+  return { ok: true };
+}
+async function apiSaveSchedule(env, token, items) {
+  const dg = await tokenDigest(token);
+  const clean = (items || []).filter(function (it) { return it && it.id && it.time; })
+    .map(function (it) { return { id: it.id, time: Number(it.time), rep: it.rep || 'none', repN: it.repN || 1, e: it.e || '' }; });
+  await env.SETTINGS.put('sched_' + dg, JSON.stringify({ items: clean, updatedAt: Date.now() }));
+  return { ok: true };
+}
+async function apiGetSchedule(env, token) {
+  const dg = await tokenDigest(token);
+  const r = await env.SETTINGS.get('sched_' + dg);
+  let items = []; if (r) { try { items = (JSON.parse(r).items) || []; } catch (e) {} }
+  return { ok: true, ids: items.map(function (it) { return it.id; }) };
+}
+// 1端末で確認/タップ → 他端末の同じ通知を閉じる（close push）＋単発はスケジュールから除去
+async function apiAckReminder(env, token, id, ctx) {
+  const dg = await tokenDigest(token);
+  const r = await env.SETTINGS.get('sched_' + dg);
+  if (r) {
+    let sched; try { sched = JSON.parse(r); } catch (e) { sched = null; }
+    if (sched && sched.items) {
+      const it = sched.items.filter(function (x) { return x.id === id; })[0];
+      const recurring = it && it.rep && it.rep !== 'none';
+      if (!recurring) { sched.items = sched.items.filter(function (x) { return x.id !== id; }); await env.SETTINGS.put('sched_' + dg, JSON.stringify(sched)); }
+    }
+  }
+  const subs = await subList(env, dg);
+  for (const s of subs) { try { await sendWebPush(s, { t: 'close', id: id }, env); } catch (e) {} }
+  return { ok: true };
+}
+async function apiPushTest(env, token, ctx) {
+  const dg = await tokenDigest(token);
+  const subs = await subList(env, dg);
+  if (!subs.length) return { ok: false, message: 'この端末はまだプッシュ購読していません（通知をオンにしてください）' };
+  let sent = 0;
+  for (const s of subs) { try { const st = await sendWebPush(s, { t: 'test' }, env); if (st >= 200 && st < 300) sent++; } catch (e) {} }
+  return { ok: true, sent: sent, subs: subs.length };
+}
+
+// Cron 本体：全ユーザーのスケジュールを走査し、期限到来分を送信
+async function runDueReminders(env) {
+  const now = Date.now();
+  const list = await env.SETTINGS.list({ prefix: 'sched_' });
+  for (const k of list.keys) {
+    const dg = k.name.slice('sched_'.length);
+    const raw = await env.SETTINGS.get(k.name); if (!raw) continue;
+    let sched; try { sched = JSON.parse(raw); } catch (e) { continue; }
+    const items = sched.items || [];
+    const due = items.filter(function (it) { return Number(it.time) <= now; });
+    if (!due.length) continue;
+    const m = await loadSubs(env, dg);
+    const devices = Object.keys(m);
+    if (!devices.length) { // 購読端末ゼロなら、過ぎた単発は溜めないよう掃除だけ
+      sched.items = items.filter(function (it) { return (it.rep && it.rep !== 'none') || Number(it.time) > now; });
+      await env.SETTINGS.put(k.name, JSON.stringify(sched));
+      continue;
+    }
+    let changed = false; const dead = [];
+    for (const it of due) {
+      const oneShot = !(it.rep && it.rep !== 'none');
+      const payload = { t: 'fire', id: it.id, e: it.e || '', oneShot: oneShot };
+      for (const d of devices) {
+        try { const st = await sendWebPush(m[d], payload, env); if (st === 404 || st === 410) dead.push(d); } catch (e) {}
+      }
+      if (oneShot) { it._done = true; changed = true; }
+      else { let nt = advanceTime(Number(it.time), it.rep, it.repN), g = 0; while (nt <= now && g < 100000) { nt = advanceTime(nt, it.rep, it.repN); g++; } it.time = nt; changed = true; }
+    }
+    if (dead.length) { dead.forEach(function (d) { delete m[d]; }); await env.SETTINGS.put('push_' + dg, JSON.stringify(m)); }
+    if (changed) { sched.items = items.filter(function (it) { return !it._done; }); await env.SETTINGS.put(k.name, JSON.stringify(sched)); }
+  }
 }

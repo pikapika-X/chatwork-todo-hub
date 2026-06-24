@@ -6,3 +6,12 @@ compatibility_date = "2024-11-01"
 [[kv_namespaces]]
 binding = "SETTINGS"
 id = "212d57d010124e6394d664d6b585a5c0"
+
+# Web Push のスケジュール送信（毎分チェック）
+[triggers]
+crons = ["* * * * *"]
+
+# VAPID 公開鍵と連絡先（公開情報なので vars でOK）。秘密鍵は `wrangler secret put VAPID_PRIVATE` で設定する。
+[vars]
+VAPID_PUBLIC = "BMlWkICpKyVNWuj_dDJ29MHAHYTib04mlZqXvJ_fJrRKKYZMaFVcQSqejsdG1NYtm25EaeAttaCuoVlptQ8RL4w"
+VAPID_SUBJECT = "https://pikapika-x.github.io/chatwork-todo-hub/"

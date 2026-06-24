@@ -71,7 +71,13 @@
         apiCompleteTask: function (token, roomId, taskId) { call('completeTask', { token: token, roomId: roomId, taskId: taskId }); },
         apiRefetchRoom: function (token, room) { call('roomTasksBatch', { token: token, rooms: [room], force: true }); }, // 完了後にその部屋だけ取り直してキャッシュ更新
         apiLoadSettings: function (token) { call('loadSettings', { token: token }); },
-        apiSaveSettings: function (token, payload, clientUpdatedAt) { call('saveSettings', { token: token, payload: payload, clientUpdatedAt: clientUpdatedAt }); }
+        apiSaveSettings: function (token, payload, clientUpdatedAt) { call('saveSettings', { token: token, payload: payload, clientUpdatedAt: clientUpdatedAt }); },
+        apiSavePushSub: function (token, deviceId, sub) { call('savePushSub', { token: token, deviceId: deviceId, sub: sub }); },
+        apiRemovePushSub: function (token, deviceId) { call('removePushSub', { token: token, deviceId: deviceId }); },
+        apiSaveSchedule: function (token, items) { call('saveSchedule', { token: token, items: items }); },
+        apiGetSchedule: function (token) { call('getSchedule', { token: token }); },
+        apiAckReminder: function (token, id) { call('ackReminder', { token: token, id: id }); },
+        apiPushTest: function (token) { call('pushTest', { token: token }); }
       };
       return api;
     }
@@ -450,6 +456,11 @@
     var NOTIFY_KEY = 'cwTodoNotify'; // 本体通知のオンオフ（端末ごと・同期しない）
     var notifyOn = false;
     var swReg = null;                // 通知用サービスワーカーの登録
+    // ===== Web Push（アプリを閉じていても通知）=====
+    var VAPID_PUBLIC = 'BMlWkICpKyVNWuj_dDJ29MHAHYTib04mlZqXvJ_fJrRKKYZMaFVcQSqejsdG1NYtm25EaeAttaCuoVlptQ8RL4w';
+    var DEVICE_KEY = 'cwTodoDevice';  // 端末ごとの識別子（同期しない）
+    var deviceId = '';
+    var pushReady = false;            // この端末がプッシュ購読済みか（trueなら通知はサーバ送信に任せる）
     var BM_KEY = 'cwTodoBookmarks';
     var bookmarks = [];
     var draggingTask = null;
@@ -502,6 +513,7 @@
         if (document.hidden || !token) return;
         if (pushTimer) flushPush();
         pullSettings(function () { if (cache.room) { buildRoomFilter(); buildAssigneeFilter(); render(); } });
+        reconcileSchedule(); // バックグラウンド中にサーバが送信した単発リマインドを一覧へ反映
       });
       window.addEventListener('beforeunload', function () { if (pushTimer) flushPush(); }); // 離脱前に未送信分を保存
       // 通知から起動した場合、対象タスクを覚えておく（?focus=roomId-taskId）。データ取得後に該当カードへ移動する。
@@ -701,13 +713,19 @@
           document.getElementById('who').textContent = me.name + ' さん';
           document.getElementById('remZone').classList.remove('hidden');
           updateRemCount();
-          pullSettings(function () { switchView('mine'); }); // 先に別端末の設定を取り込んでから表示
+          pullSettings(function () { // 先に別端末の設定を取り込んでから表示
+            switchView('mine');
+            if (notifyOn) registerPush(); // 通知オンの端末は購読を更新＋スケジュール送信
+            else pushSchedule();          // 通知オフでも（他端末向けに）スケジュールは最新化
+            reconcileSchedule();          // サーバが送信済みの単発リマインドを一覧へ反映
+          });
         })
         .withFailureHandler(function (e) { setTokenMsg(String(e && e.message ? e.message : e)); })
         .apiInit(token);
     }
 
     function changeToken() {
+      unregisterPush(); // この端末のプッシュ購読を解除（token を使うので先に）
       localStorage.removeItem(TOKEN_KEY);
       token = ''; me = null; cache = { room: null };
       document.getElementById('appView').classList.add('hidden');
@@ -1593,6 +1611,7 @@
         });
       }
       lsSet(REM_KEY, JSON.stringify(reminders));
+      pushSchedule(); // サーバ送信スケジュールを更新（アプリを閉じていても通知が届くように）
       closeRemDialog(); updateRemCount();
       var listEl = document.getElementById('remList');
       if (listEl && !listEl.classList.contains('hidden')) renderRemList();
@@ -1604,11 +1623,103 @@
       try {
         navigator.serviceWorker.register('sw.js').catch(function (_) {});
         navigator.serviceWorker.ready.then(function (reg) { swReg = reg; }).catch(function (_) {});
-        // 通知タップ（SW）からの「このタスクへ移動」指示を受け取る（アプリが既に開いている場合）
+        // SW からの指示（タスクへ移動 / リマインド発火の即時反映）
         navigator.serviceWorker.addEventListener('message', function (e) {
-          var d = e.data || {}; if (d.type === 'focusTask') focusTask(d.roomId, d.taskId);
+          var d = e.data || {};
+          if (d.type === 'focusTask') focusTask(d.roomId, d.taskId);
+          else if (d.type === 'reminderFired') markReminderFired(d.id);
         });
       } catch (_) {}
+    }
+    // ===== Web Push のヘルパー =====
+    function urlB64ToU8(s) {
+      var pad = '='.repeat((4 - s.length % 4) % 4);
+      var b = (s + pad).replace(/-/g, '+').replace(/_/g, '/');
+      var raw = atob(b), o = new Uint8Array(raw.length);
+      for (var i = 0; i < raw.length; i++) o[i] = raw.charCodeAt(i);
+      return o;
+    }
+    // SW が push 本文の復号と ack に使う token を IndexedDB に保存（端末内のみ）
+    function idbPut(key, val) {
+      return new Promise(function (res) {
+        var rq = indexedDB.open('cwpush', 1);
+        rq.onupgradeneeded = function () { try { rq.result.createObjectStore('kv'); } catch (_) {} };
+        rq.onsuccess = function () { try { var tx = rq.result.transaction('kv', 'readwrite'); tx.objectStore('kv').put(val, key); tx.oncomplete = function () { res(); }; tx.onerror = function () { res(); }; } catch (_) { res(); } };
+        rq.onerror = function () { res(); };
+      });
+    }
+    function idbDel(key) {
+      return new Promise(function (res) {
+        var rq = indexedDB.open('cwpush', 1);
+        rq.onupgradeneeded = function () { try { rq.result.createObjectStore('kv'); } catch (_) {} };
+        rq.onsuccess = function () { try { var tx = rq.result.transaction('kv', 'readwrite'); tx.objectStore('kv').delete(key); tx.oncomplete = function () { res(); }; tx.onerror = function () { res(); }; } catch (_) { res(); } };
+        rq.onerror = function () { res(); };
+      });
+    }
+    function ensureDeviceId() {
+      deviceId = localStorage.getItem(DEVICE_KEY) || '';
+      if (!deviceId) { deviceId = 'd' + Date.now() + Math.floor(Math.random() * 1e6); localStorage.setItem(DEVICE_KEY, deviceId); }
+      return deviceId;
+    }
+    // プッシュ購読を登録（通知オン時）。購読情報をサーバへ、token を SW 用に保存し、スケジュールを送る。
+    function registerPush() {
+      if (!('serviceWorker' in navigator) || !('PushManager' in window) || !token) return;
+      ensureDeviceId();
+      navigator.serviceWorker.ready
+        .then(function (reg) { swReg = reg; return reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: urlB64ToU8(VAPID_PUBLIC) }); })
+        .then(function (sub) {
+          pushReady = true;
+          idbPut('token', token);
+          var j = sub.toJSON();
+          google.script.run.apiSavePushSub(token, deviceId, { endpoint: j.endpoint, keys: j.keys });
+          pushSchedule();
+        })
+        .catch(function () { pushReady = false; });
+    }
+    function unregisterPush() {
+      pushReady = false; idbDel('token');
+      if (token) google.script.run.apiRemovePushSub(token, ensureDeviceId());
+      if ('serviceWorker' in navigator) navigator.serviceWorker.ready.then(function (reg) { return reg.pushManager.getSubscription(); }).then(function (s) { if (s) s.unsubscribe(); }).catch(function () {});
+    }
+    // 未確認リマインドを暗号化してサーバへ（サーバは中身を読めない＝時刻で送信するだけ）
+    function pushSchedule() {
+      if (!token) return;
+      var pend = reminders.filter(function (r) { return !r.fired; });
+      Promise.all(pend.map(function (r) {
+        var disp = JSON.stringify({ title: '⏰ ' + (r.room ? 'リマインド：' + r.room : 'リマインド'), body: r.body || '', roomId: r.roomId, taskId: r.taskId });
+        return encryptStr(disp).then(function (e) { return { id: r.id, time: r.time, rep: r.rep || 'none', repN: r.repN || 1, e: e }; });
+      })).then(function (items) { google.script.run.apiSaveSchedule(token, items); }).catch(function () {});
+    }
+    // サーバが送信済み（単発はスケジュールから消える）の単発リマインドを一覧でも「済み」にする
+    function reconcileSchedule() {
+      if (!token) return;
+      google.script.run.withSuccessHandler(function (r) {
+        if (!r || !r.ok || !r.ids) return;
+        var live = {}; r.ids.forEach(function (id) { live[id] = true; });
+        var now = Date.now(), changed = false;
+        reminders.forEach(function (rm) {
+          if (rm.fired) return;
+          var recurring = rm.rep && rm.rep !== 'none';
+          if (!recurring && !live[rm.id] && rm.time <= now) { rm.fired = true; changed = true; }
+        });
+        if (changed) { lsSet(REM_KEY, JSON.stringify(reminders)); updateRemCount(); var le = document.getElementById('remList'); if (le && !le.classList.contains('hidden')) renderRemList(); }
+      }).withFailureHandler(function () {}).apiGetSchedule(token);
+    }
+    // SW から「発火した」と通知された単発リマインドを一覧でも済みにする
+    function markReminderFired(id) {
+      var rm = reminders.filter(function (x) { return x.id === id; })[0];
+      if (!rm || rm.fired) return;
+      if (rm.rep && rm.rep !== 'none') return; // 繰り返しは継続
+      rm.fired = true; lsSet(REM_KEY, JSON.stringify(reminders)); updateRemCount();
+      var le = document.getElementById('remList'); if (le && !le.classList.contains('hidden')) renderRemList();
+    }
+    function sendPushTest() {
+      if (!token) return;
+      if (!pushReady) { alert('先に「🔔 本体に通知」をオンにしてください。'); return; }
+      google.script.run.withSuccessHandler(function (r) {
+        if (r && r.ok) alert('テスト通知を送信しました（' + (r.sent || 0) + '/' + (r.subs || 0) + ' 端末）。数秒以内に届くか確認してください。');
+        else alert('送信できませんでした: ' + ((r && r.message) || '不明'));
+      }).withFailureHandler(function (e) { alert('エラー: ' + (e && e.message ? e.message : e)); }).apiPushTest(token);
     }
     // 通知許可をユーザー操作の中から要求（コールバック/Promise 両対応・二重呼び防止）
     function requestNotifyPerm(cb) {
@@ -1625,19 +1736,19 @@
       if (on) {
         requestNotifyPerm(function (granted) {
           notifyOn = granted;
-          if (granted) { localStorage.setItem(NOTIFY_KEY, '1'); } else { localStorage.removeItem(NOTIFY_KEY); }
+          if (granted) { localStorage.setItem(NOTIFY_KEY, '1'); registerPush(); } else { localStorage.removeItem(NOTIFY_KEY); }
           renderRemList();
           if (!granted) alert('通知を有効にできませんでした。ブラウザ（またはOS）の通知許可がブロックされていないかご確認ください。');
         });
       } else {
-        notifyOn = false; localStorage.removeItem(NOTIFY_KEY); renderRemList();
+        notifyOn = false; localStorage.removeItem(NOTIFY_KEY); unregisterPush(); renderRemList();
       }
     }
     function notifyStatusText() {
       if (!('Notification' in window)) return 'この端末／ブラウザは通知に対応していません。';
       if (Notification.permission === 'denied') return '⚠ ブラウザで通知がブロックされています。サイトの設定から許可してください。';
-      if (notifyOn && Notification.permission === 'granted') return 'アプリを開いている間、時刻になるとPC/スマホ本体に通知します。';
-      return 'オンにすると、時刻になったとき本体に通知します（この端末のみ）。';
+      if (notifyOn && Notification.permission === 'granted') return 'アプリを閉じていても、時刻になるとこの端末に通知します（PC・スマホ各端末で個別にオン）。';
+      return 'オンにすると、アプリを閉じていても時刻に本体へ通知します（この端末のみ。スマホはホーム画面に追加が必要）。';
     }
     function buildNotifyToggle() {
       var box = document.createElement('div'); box.className = 'notifyBox';
@@ -1648,6 +1759,13 @@
       lab.appendChild(cb); lab.appendChild(sp);
       var note = document.createElement('div'); note.className = 'notifyNote'; note.textContent = notifyStatusText();
       box.appendChild(lab); box.appendChild(note);
+      if (notifyOn) {
+        var tb = document.createElement('button'); tb.className = 'ghost';
+        tb.style.cssText = 'margin-top:8px;min-height:30px;font-size:12px';
+        tb.textContent = '🔔 テスト通知を送る';
+        tb.onclick = function (e) { e.stopPropagation(); sendPushTest(); };
+        box.appendChild(tb);
+      }
       return box;
     }
     // 次回の発火時刻を返す（DST に強い Date 演算）
@@ -1664,17 +1782,17 @@
       var now = Date.now(), changed = false;
       reminders.forEach(function (r) {
         if (r.fired || r.time > now) return;
-        fireReminder(r); changed = true;
+        if (!pushReady) fireReminder(r); // プッシュ購読済みの端末は通知をサーバ送信に任せる（二重通知を防ぐ）
         if (r.rep && r.rep !== 'none') {
           // 繰り返しは fired にせず、次の未来の時刻へ進める（閉じていた間の積み残しは1回だけ通知）
           var nt = nextTime(r.time, r.rep, r.repN), guard = 0;
           while (nt <= now && guard < 100000) { nt = nextTime(nt, r.rep, r.repN); guard++; }
-          r.time = nt;
-        } else {
-          r.fired = true;
+          r.time = nt; changed = true;
+        } else if (!pushReady) {
+          r.fired = true; changed = true; // 単発：ローカル通知時はここで済み。プッシュ時はサーバ発火→reconcile/markで済みになる
         }
       });
-      if (changed) { lsSet(REM_KEY, JSON.stringify(reminders)); updateRemCount(); }
+      if (changed) { lsSet(REM_KEY, JSON.stringify(reminders)); updateRemCount(); if (pushReady) pushSchedule(); }
     }
     function fireReminder(r) {
       var title = '⏰ リマインド' + (r.room ? '：' + r.room : '');
@@ -1723,6 +1841,7 @@
     function cancelReminder(id) {
       reminders = reminders.filter(function (r) { return r.id !== id; });
       lsSet(REM_KEY, JSON.stringify(reminders));
+      pushSchedule(); // サーバ送信スケジュールからも除去
       updateRemCount(); renderRemList();
     }
     function repLabel(r) {
